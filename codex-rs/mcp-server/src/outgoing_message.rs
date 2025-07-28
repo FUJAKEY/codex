@@ -78,6 +78,14 @@ impl OutgoingMessageSender {
         let _ = self.sender.send(outgoing_message).await;
     }
 
+    pub(crate) async fn send_notification(&self, method: &str, params: Option<serde_json::Value>) {
+        let outgoing_message = OutgoingMessage::Notification(OutgoingNotification {
+            method: method.to_string(),
+            params,
+        });
+        let _ = self.sender.send(outgoing_message).await;
+    }
+
     pub(crate) async fn send_event_as_notification(&self, event: &Event) {
         #[expect(clippy::expect_used)]
         let params = Some(serde_json::to_value(event).expect("Event must serialize"));
@@ -103,6 +111,7 @@ impl OutgoingMessageSender {
         });
         let _ = self.sender.send(outgoing_message).await;
     }
+
     pub(crate) async fn send_error(&self, id: RequestId, error: JSONRPCErrorError) {
         let outgoing_message = OutgoingMessage::Error(OutgoingError { id, error });
         let _ = self.sender.send(outgoing_message).await;

@@ -112,6 +112,8 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         model_provider: None,
         codex_linux_sandbox_exe,
         base_instructions: None,
+        mcp_servers: None,
+        experimental_client_tools: None,
     };
     // Parse `-c` overrides.
     let cli_kv_overrides = match config_overrides.parse_overrides() {

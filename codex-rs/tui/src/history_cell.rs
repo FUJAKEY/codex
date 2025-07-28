@@ -1,5 +1,4 @@
 use crate::cell_widget::CellWidget;
-use crate::exec_command::escape_command;
 use crate::markdown::append_markdown;
 use crate::text_block::TextBlock;
 use crate::text_formatting::format_and_truncate_tool_result;
@@ -12,6 +11,7 @@ use codex_core::config::Config;
 use codex_core::model_supports_reasoning_summaries;
 use codex_core::protocol::FileChange;
 use codex_core::protocol::SessionConfiguredEvent;
+use codex_core::util::escape_command;
 use image::DynamicImage;
 use image::GenericImageView;
 use image::ImageReader;
@@ -678,6 +678,7 @@ fn create_diff_summary(changes: HashMap<PathBuf, FileChange>) -> Vec<String> {
             Update {
                 unified_diff,
                 move_path,
+                ..
             } => {
                 if let Some(new_path) = move_path {
                     summaries.push(format!("R {} → {}", path.display(), new_path.display(),));

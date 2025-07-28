@@ -2,6 +2,7 @@ mod parser;
 mod seek_sequence;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::Utf8Error;
@@ -18,6 +19,33 @@ use thiserror::Error;
 use tree_sitter::LanguageError;
 use tree_sitter::Parser;
 use tree_sitter_bash::LANGUAGE as BASH;
+
+pub trait FileSystem {
+    /// Read the entire contents of a file as a string.
+    fn read_text_file(&self, path: &Path) -> impl Future<Output = std::io::Result<String>> + Send;
+
+    /// Write text data to a file, replacing its contents.
+    fn write_text_file(
+        &self,
+        path: &Path,
+        contents: String,
+    ) -> impl Future<Output = std::io::Result<()>> + Send;
+}
+
+/// Standard file system implementation using std::fs.
+pub struct StdFileSystem;
+
+impl FileSystem for StdFileSystem {
+    // todo! these were originally blocking, so I kept them that way.
+    // should we make them async?
+    async fn read_text_file(&self, path: &Path) -> std::io::Result<String> {
+        std::fs::read_to_string(path)
+    }
+
+    async fn write_text_file(&self, path: &Path, contents: String) -> std::io::Result<()> {
+        std::fs::write(path, contents)
+    }
+}
 
 /// Detailed instructions for gpt-4.1 on how to use the `apply_patch` tool.
 pub const APPLY_PATCH_TOOL_INSTRUCTIONS: &str = include_str!("../apply_patch_tool_instructions.md");
@@ -96,6 +124,7 @@ pub enum ApplyPatchFileChange {
     Update {
         unified_diff: String,
         move_path: Option<PathBuf>,
+        original_content: String,
         /// new_content that will result after the unified_diff is applied.
         new_content: String,
     },
@@ -147,7 +176,11 @@ impl ApplyPatchAction {
 
 /// cwd must be an absolute path so that we can resolve relative paths in the
 /// patch.
-pub fn maybe_parse_apply_patch_verified(argv: &[String], cwd: &Path) -> MaybeApplyPatchVerified {
+pub async fn maybe_parse_apply_patch_verified(
+    argv: &[String],
+    cwd: &Path,
+    fs: &impl FileSystem,
+) -> MaybeApplyPatchVerified {
     match maybe_parse_apply_patch(argv) {
         MaybeApplyPatch::Body(hunks) => {
             let mut changes = HashMap::new();
@@ -165,8 +198,9 @@ pub fn maybe_parse_apply_patch_verified(argv: &[String], cwd: &Path) -> MaybeApp
                     } => {
                         let ApplyPatchFileUpdate {
                             unified_diff,
+                            original_content,
                             content: contents,
-                        } = match unified_diff_from_chunks(&path, &chunks) {
+                        } = match unified_diff_from_chunks(&path, &chunks, fs).await {
                             Ok(diff) => diff,
                             Err(e) => {
                                 return MaybeApplyPatchVerified::CorrectnessError(e);
@@ -177,6 +211,7 @@ pub fn maybe_parse_apply_patch_verified(argv: &[String], cwd: &Path) -> MaybeApp
                             ApplyPatchFileChange::Update {
                                 unified_diff,
                                 move_path: move_path.map(|p| cwd.join(p)),
+                                original_content,
                                 new_content: contents,
                             },
                         );
@@ -258,10 +293,11 @@ pub enum ExtractHeredocError {
 }
 
 /// Applies the patch and prints the result to stdout/stderr.
-pub fn apply_patch(
+pub async fn apply_patch(
     patch: &str,
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
+    fs: &impl FileSystem,
 ) -> Result<(), ApplyPatchError> {
     let hunks = match parse_patch(patch) {
         Ok(hunks) => hunks,
@@ -285,16 +321,17 @@ pub fn apply_patch(
         }
     };
 
-    apply_hunks(&hunks, stdout, stderr)?;
+    apply_hunks(&hunks, stdout, stderr, fs).await?;
 
     Ok(())
 }
 
 /// Applies hunks and continues to update stdout/stderr
-pub fn apply_hunks(
+pub async fn apply_hunks(
     hunks: &[Hunk],
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
+    fs: &impl FileSystem,
 ) -> Result<(), ApplyPatchError> {
     let _existing_paths: Vec<&Path> = hunks
         .iter()
@@ -323,7 +360,7 @@ pub fn apply_hunks(
         .collect::<Vec<&Path>>();
 
     // Delegate to a helper that applies each hunk to the filesystem.
-    match apply_hunks_to_files(hunks) {
+    match apply_hunks_to_files(hunks, fs).await {
         Ok(affected) => {
             print_summary(&affected, stdout).map_err(ApplyPatchError::from)?;
         }
@@ -346,7 +383,10 @@ pub struct AffectedPaths {
 
 /// Apply the hunks to the filesystem, returning which files were added, modified, or deleted.
 /// Returns an error if the patch could not be applied.
-fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
+async fn apply_hunks_to_files(
+    hunks: &[Hunk],
+    fs: &impl FileSystem,
+) -> anyhow::Result<AffectedPaths> {
     if hunks.is_empty() {
         anyhow::bail!("No files were modified.");
     }
@@ -364,7 +404,8 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
                         })?;
                     }
                 }
-                std::fs::write(path, contents)
+                fs.write_text_file(path, contents.clone())
+                    .await
                     .with_context(|| format!("Failed to write file {}", path.display()))?;
                 added.push(path.clone());
             }
@@ -379,7 +420,7 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
                 chunks,
             } => {
                 let AppliedPatch { new_contents, .. } =
-                    derive_new_contents_from_chunks(path, chunks)?;
+                    derive_new_contents_from_chunks(path, chunks, fs).await?;
                 if let Some(dest) = move_path {
                     if let Some(parent) = dest.parent() {
                         if !parent.as_os_str().is_empty() {
@@ -391,13 +432,15 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
                             })?;
                         }
                     }
-                    std::fs::write(dest, new_contents)
+                    fs.write_text_file(dest, new_contents.clone())
+                        .await
                         .with_context(|| format!("Failed to write file {}", dest.display()))?;
                     std::fs::remove_file(path)
                         .with_context(|| format!("Failed to remove original {}", path.display()))?;
                     modified.push(dest.clone());
                 } else {
-                    std::fs::write(path, new_contents)
+                    fs.write_text_file(path, new_contents)
+                        .await
                         .with_context(|| format!("Failed to write file {}", path.display()))?;
                     modified.push(path.clone());
                 }
@@ -418,11 +461,12 @@ struct AppliedPatch {
 
 /// Return *only* the new file contents (joined into a single `String`) after
 /// applying the chunks to the file at `path`.
-fn derive_new_contents_from_chunks(
+async fn derive_new_contents_from_chunks(
     path: &Path,
     chunks: &[UpdateFileChunk],
+    fs: &impl FileSystem,
 ) -> std::result::Result<AppliedPatch, ApplyPatchError> {
-    let original_contents = match std::fs::read_to_string(path) {
+    let original_contents = match fs.read_text_file(path).await {
         Ok(contents) => contents,
         Err(err) => {
             return Err(ApplyPatchError::IoError(IoError {
@@ -576,29 +620,33 @@ fn apply_replacements(
 #[derive(Debug, Eq, PartialEq)]
 pub struct ApplyPatchFileUpdate {
     unified_diff: String,
+    original_content: String,
     content: String,
 }
 
-pub fn unified_diff_from_chunks(
+pub async fn unified_diff_from_chunks(
     path: &Path,
     chunks: &[UpdateFileChunk],
+    fs: &impl FileSystem,
 ) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
-    unified_diff_from_chunks_with_context(path, chunks, 1)
+    unified_diff_from_chunks_with_context(path, chunks, 1, fs).await
 }
 
-pub fn unified_diff_from_chunks_with_context(
+pub async fn unified_diff_from_chunks_with_context(
     path: &Path,
     chunks: &[UpdateFileChunk],
     context: usize,
+    fs: &impl FileSystem,
 ) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
     let AppliedPatch {
         original_contents,
         new_contents,
-    } = derive_new_contents_from_chunks(path, chunks)?;
+    } = derive_new_contents_from_chunks(path, chunks, fs).await?;
     let text_diff = TextDiff::from_lines(&original_contents, &new_contents);
     let unified_diff = text_diff.unified_diff().context_radius(context).to_string();
     Ok(ApplyPatchFileUpdate {
         unified_diff,
+        original_content: original_contents,
         content: new_contents,
     })
 }
@@ -692,8 +740,8 @@ PATCH"#,
         }
     }
 
-    #[test]
-    fn test_add_file_hunk_creates_file_with_contents() {
+    #[tokio::test]
+    async fn test_add_file_hunk_creates_file_with_contents() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("add.txt");
         let patch = wrap_patch(&format!(
@@ -704,7 +752,9 @@ PATCH"#,
         ));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(&patch, &mut stdout, &mut stderr, &StdFileSystem)
+            .await
+            .unwrap();
         // Verify expected stdout and stderr outputs.
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
@@ -718,15 +768,17 @@ PATCH"#,
         assert_eq!(contents, "ab\ncd\n");
     }
 
-    #[test]
-    fn test_delete_file_hunk_removes_file() {
+    #[tokio::test]
+    async fn test_delete_file_hunk_removes_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("del.txt");
         fs::write(&path, "x").unwrap();
         let patch = wrap_patch(&format!("*** Delete File: {}", path.display()));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(&patch, &mut stdout, &mut stderr, &StdFileSystem)
+            .await
+            .unwrap();
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
         let expected_out = format!(
@@ -738,8 +790,8 @@ PATCH"#,
         assert!(!path.exists());
     }
 
-    #[test]
-    fn test_update_file_hunk_modifies_content() {
+    #[tokio::test]
+    async fn test_update_file_hunk_modifies_content() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("update.txt");
         fs::write(&path, "foo\nbar\n").unwrap();
@@ -753,7 +805,9 @@ PATCH"#,
         ));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(&patch, &mut stdout, &mut stderr, &StdFileSystem)
+            .await
+            .unwrap();
         // Validate modified file contents and expected stdout/stderr.
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
@@ -767,8 +821,8 @@ PATCH"#,
         assert_eq!(contents, "foo\nbaz\n");
     }
 
-    #[test]
-    fn test_update_file_hunk_can_move_file() {
+    #[tokio::test]
+    async fn test_update_file_hunk_can_move_file() {
         let dir = tempdir().unwrap();
         let src = dir.path().join("src.txt");
         let dest = dir.path().join("dst.txt");
@@ -784,7 +838,9 @@ PATCH"#,
         ));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(&patch, &mut stdout, &mut stderr, &StdFileSystem)
+            .await
+            .unwrap();
         // Validate move semantics and expected stdout/stderr.
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
@@ -801,8 +857,8 @@ PATCH"#,
 
     /// Verify that a single `Update File` hunk with multiple change chunks can update different
     /// parts of a file and that the file is listed only once in the summary.
-    #[test]
-    fn test_multiple_update_chunks_apply_to_single_file() {
+    #[tokio::test]
+    async fn test_multiple_update_chunks_apply_to_single_file() {
         // Start with a file containing four lines.
         let dir = tempdir().unwrap();
         let path = dir.path().join("multi.txt");
@@ -824,7 +880,9 @@ PATCH"#,
         ));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(&patch, &mut stdout, &mut stderr, &StdFileSystem)
+            .await
+            .unwrap();
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
         let expected_out = format!(
@@ -841,8 +899,8 @@ PATCH"#,
     /// replacements in separate chunks that appear in non‑adjacent parts of the
     /// file.  Verifies that all edits are applied and that the summary lists the
     /// file only once.
-    #[test]
-    fn test_update_file_hunk_interleaved_changes() {
+    #[tokio::test]
+    async fn test_update_file_hunk_interleaved_changes() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("interleaved.txt");
 
@@ -873,7 +931,9 @@ PATCH"#,
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(&patch, &mut stdout, &mut stderr, &StdFileSystem)
+            .await
+            .unwrap();
 
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
@@ -895,8 +955,8 @@ PATCH"#,
     /// internal matcher failed requiring an exact byte-for-byte match.  The
     /// fuzzy-matching pass that normalises common punctuation should now bridge
     /// the gap.
-    #[test]
-    fn test_update_line_with_unicode_dash() {
+    #[tokio::test]
+    async fn test_update_line_with_unicode_dash() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("unicode.py");
 
@@ -915,7 +975,9 @@ PATCH"#,
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(&patch, &mut stdout, &mut stderr, &StdFileSystem)
+            .await
+            .unwrap();
 
         // File should now contain the replaced comment.
         let expected = "import asyncio  # HELLO\n";
@@ -934,8 +996,8 @@ PATCH"#,
         assert_eq!(String::from_utf8(stderr).unwrap(), "");
     }
 
-    #[test]
-    fn test_unified_diff() {
+    #[tokio::test]
+    async fn test_unified_diff() {
         // Start with a file containing four lines.
         let dir = tempdir().unwrap();
         let path = dir.path().join("multi.txt");
@@ -958,7 +1020,9 @@ PATCH"#,
             [Hunk::UpdateFile { chunks, .. }] => chunks,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
-        let diff = unified_diff_from_chunks(&path, update_file_chunks).unwrap();
+        let diff = unified_diff_from_chunks(&path, update_file_chunks, &StdFileSystem)
+            .await
+            .unwrap();
         let expected_diff = r#"@@ -1,4 +1,4 @@
  foo
 -bar
@@ -969,13 +1033,14 @@ PATCH"#,
 "#;
         let expected = ApplyPatchFileUpdate {
             unified_diff: expected_diff.to_string(),
+            original_content: "foo\nbar\nbaz\nqux\n".to_string(),
             content: "foo\nBAR\nbaz\nQUX\n".to_string(),
         };
         assert_eq!(expected, diff);
     }
 
-    #[test]
-    fn test_unified_diff_first_line_replacement() {
+    #[tokio::test]
+    async fn test_unified_diff_first_line_replacement() {
         // Replace the very first line of the file.
         let dir = tempdir().unwrap();
         let path = dir.path().join("first.txt");
@@ -997,7 +1062,9 @@ PATCH"#,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
 
-        let diff = unified_diff_from_chunks(&path, chunks).unwrap();
+        let diff = unified_diff_from_chunks(&path, chunks, &StdFileSystem)
+            .await
+            .unwrap();
         let expected_diff = r#"@@ -1,2 +1,2 @@
 -foo
 +FOO
@@ -1005,13 +1072,14 @@ PATCH"#,
 "#;
         let expected = ApplyPatchFileUpdate {
             unified_diff: expected_diff.to_string(),
+            original_content: "foo\nbar\nbaz\n".to_string(),
             content: "FOO\nbar\nbaz\n".to_string(),
         };
         assert_eq!(expected, diff);
     }
 
-    #[test]
-    fn test_unified_diff_last_line_replacement() {
+    #[tokio::test]
+    async fn test_unified_diff_last_line_replacement() {
         // Replace the very last line of the file.
         let dir = tempdir().unwrap();
         let path = dir.path().join("last.txt");
@@ -1034,7 +1102,9 @@ PATCH"#,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
 
-        let diff = unified_diff_from_chunks(&path, chunks).unwrap();
+        let diff = unified_diff_from_chunks(&path, chunks, &StdFileSystem)
+            .await
+            .unwrap();
         let expected_diff = r#"@@ -2,2 +2,2 @@
  bar
 -baz
@@ -1042,13 +1112,14 @@ PATCH"#,
 "#;
         let expected = ApplyPatchFileUpdate {
             unified_diff: expected_diff.to_string(),
+            original_content: "foo\nbar\nbaz\n".to_string(),
             content: "foo\nbar\nBAZ\n".to_string(),
         };
         assert_eq!(expected, diff);
     }
 
-    #[test]
-    fn test_unified_diff_insert_at_eof() {
+    #[tokio::test]
+    async fn test_unified_diff_insert_at_eof() {
         // Insert a new line at end‑of‑file.
         let dir = tempdir().unwrap();
         let path = dir.path().join("insert.txt");
@@ -1069,20 +1140,23 @@ PATCH"#,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
 
-        let diff = unified_diff_from_chunks(&path, chunks).unwrap();
+        let diff = unified_diff_from_chunks(&path, chunks, &StdFileSystem)
+            .await
+            .unwrap();
         let expected_diff = r#"@@ -3 +3,2 @@
  baz
 +quux
 "#;
         let expected = ApplyPatchFileUpdate {
             unified_diff: expected_diff.to_string(),
+            original_content: "foo\nbar\nbaz\n".to_string(),
             content: "foo\nbar\nbaz\nquux\n".to_string(),
         };
         assert_eq!(expected, diff);
     }
 
-    #[test]
-    fn test_unified_diff_interleaved_changes() {
+    #[tokio::test]
+    async fn test_unified_diff_interleaved_changes() {
         // Original file with six lines.
         let dir = tempdir().unwrap();
         let path = dir.path().join("interleaved.txt");
@@ -1115,7 +1189,9 @@ PATCH"#,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
 
-        let diff = unified_diff_from_chunks(&path, chunks).unwrap();
+        let diff = unified_diff_from_chunks(&path, chunks, &StdFileSystem)
+            .await
+            .unwrap();
 
         let expected_diff = r#"@@ -1,6 +1,7 @@
  a
@@ -1131,6 +1207,7 @@ PATCH"#,
 
         let expected = ApplyPatchFileUpdate {
             unified_diff: expected_diff.to_string(),
+            original_content: "a\nb\nc\nd\ne\nf\n".to_string(),
             content: "a\nB\nc\nd\nE\nf\ng\n".to_string(),
         };
 
@@ -1138,7 +1215,9 @@ PATCH"#,
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(&patch, &mut stdout, &mut stderr, &StdFileSystem)
+            .await
+            .unwrap();
         let contents = fs::read_to_string(path).unwrap();
         assert_eq!(
             contents,
@@ -1153,8 +1232,8 @@ g
         );
     }
 
-    #[test]
-    fn test_apply_patch_should_resolve_absolute_paths_in_cwd() {
+    #[tokio::test]
+    async fn test_apply_patch_should_resolve_absolute_paths_in_cwd() {
         let session_dir = tempdir().unwrap();
         let relative_path = "source.txt";
 
@@ -1174,7 +1253,8 @@ g
                 .to_string(),
         ];
 
-        let result = maybe_parse_apply_patch_verified(&argv, session_dir.path());
+        let result =
+            maybe_parse_apply_patch_verified(&argv, session_dir.path(), &StdFileSystem).await;
 
         // Verify the patch contents - as otherwise we may have pulled contents
         // from the wrong file (as we're using relative paths)
@@ -1190,6 +1270,7 @@ g
 "#
                         .to_string(),
                         move_path: None,
+                        original_content: "session directory content\n".to_string(),
                         new_content: "updated session directory content\n".to_string(),
                     },
                 )]),

@@ -15,6 +15,7 @@ use tracing::error;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod acp_tool_runner;
 mod codex_tool_config;
 mod codex_tool_runner;
 mod exec_approval;

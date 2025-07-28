@@ -28,6 +28,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-client-protocol"
+version = "0.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be80d06d99f7870e6b9c838b1f1024f49edf615029edd5dc30a2144e41b4a409"
+dependencies = [
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -601,6 +612,7 @@ dependencies = [
  "similar",
  "tempfile",
  "thiserror 2.0.12",
+ "tokio",
  "tree-sitter",
  "tree-sitter-bash",
 ]
@@ -656,6 +668,7 @@ dependencies = [
 name = "codex-core"
 version = "0.0.0"
 dependencies = [
+ "agent-client-protocol",
  "anyhow",
  "assert_cmd",
  "async-channel",
@@ -797,6 +810,7 @@ dependencies = [
 name = "codex-mcp-server"
 version = "0.0.0"
 dependencies = [
+ "agent-client-protocol",
  "anyhow",
  "assert_cmd",
  "codex-core",
@@ -843,7 +857,6 @@ dependencies = [
  "ratatui-image",
  "regex-lite",
  "serde_json",
- "shlex",
  "strum 0.27.2",
  "strum_macros 0.27.2",
  "tokio",
@@ -3837,7 +3850,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
 dependencies = [
  "dyn-clone",
- "schemars_derive",
+ "schemars_derive 0.8.22",
  "serde",
  "serde_json",
 ]
@@ -3862,6 +3875,7 @@ checksum = "82d20c4491bc164fa2f6c5d44565947a52ad80b9505d8e36f8d54c27c739fcd0"
 dependencies = [
  "dyn-clone",
  "ref-cast",
+ "schemars_derive 1.0.4",
  "serde",
  "serde_json",
 ]
@@ -3871,6 +3885,18 @@ name = "schemars_derive"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 2.0.104",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33d020396d1d138dc19f1165df7545479dcd58d93810dc5d646a16e55abefa80"
 dependencies = [
  "proc-macro2",
  "quote",

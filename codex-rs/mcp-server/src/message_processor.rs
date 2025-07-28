@@ -4,12 +4,17 @@ use std::sync::Arc;
 
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
+use crate::codex_tool_config::create_tool_for_acp_new_session;
+use crate::codex_tool_config::create_tool_for_acp_prompt;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
 use crate::outgoing_message::OutgoingMessageSender;
 
+use agent_client_protocol as acp;
+use anyhow::Context as _;
 use codex_core::Codex;
 use codex_core::config::Config as CodexConfig;
+use codex_core::config_types::McpServerConfig;
 use codex_core::protocol::Submission;
 use mcp_types::CallToolRequestParams;
 use mcp_types::CallToolResult;
@@ -286,6 +291,8 @@ impl MessageProcessor {
             tools: vec![
                 create_tool_for_codex_tool_call_param(),
                 create_tool_for_codex_tool_call_reply_param(),
+                create_tool_for_acp_new_session(),
+                create_tool_for_acp_prompt(),
             ],
             next_cursor: None,
         };
@@ -307,6 +314,12 @@ impl MessageProcessor {
             "codex-reply" => {
                 self.handle_tool_call_codex_session_reply(id, arguments)
                     .await
+            }
+            acp::NEW_SESSION_TOOL_NAME => {
+                self.handle_tool_call_acp_new_session(id, arguments).await;
+            }
+            acp::PROMPT_TOOL_NAME => {
+                self.handle_tool_call_acp_prompt(id, arguments).await;
             }
             _ => {
                 let result = CallToolResult {
@@ -513,6 +526,192 @@ impl MessageProcessor {
                 .await;
             }
         });
+    }
+
+    async fn handle_tool_call_acp_new_session(
+        &self,
+        request_id: RequestId,
+        arguments: Option<serde_json::Value>,
+    ) {
+        let config = match Self::acp_new_session_cfg(arguments) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                tracing::warn!("Failed to construct new session config: {}", err);
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_owned(),
+                        text: format!("Failed to construct new session config: {err}"),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.outgoing
+                    .send_response(request_id, serde_json::to_value(result).unwrap_or_default())
+                    .await;
+                return;
+            }
+        };
+
+        let outgoing = self.outgoing.clone();
+        let session_map = self.session_map.clone();
+
+        task::spawn(async move {
+            let Some(session_id) = crate::acp_tool_runner::new_session(
+                request_id.clone(),
+                config,
+                outgoing.clone(),
+                session_map,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let acp_response = acp::NewSessionOutput {
+                session_id: acp::SessionId(session_id.to_string().into()),
+            };
+
+            let response = CallToolResult {
+                content: vec![],
+                is_error: None,
+                structured_content: Some(serde_json::to_value(acp_response).unwrap_or_default()),
+            };
+
+            outgoing
+                .send_response(
+                    request_id,
+                    serde_json::to_value(response).unwrap_or_default(),
+                )
+                .await;
+        });
+    }
+
+    fn acp_new_session_cfg(arguments: Option<serde_json::Value>) -> anyhow::Result<CodexConfig> {
+        let arguments = arguments.context("Arguments required")?;
+        let arguments = serde_json::from_value::<acp::NewSessionArguments>(arguments)?;
+
+        let mcp_servers: HashMap<String, McpServerConfig> = arguments
+            .mcp_servers
+            .into_iter()
+            .map(|(name, cfg)| {
+                (
+                    name,
+                    McpServerConfig {
+                        command: cfg.command.display().to_string(),
+                        args: cfg.args,
+                        env: cfg.env,
+                    },
+                )
+            })
+            .collect();
+
+        let overrides = codex_core::config::ConfigOverrides {
+            cwd: Some(arguments.cwd),
+            mcp_servers: Some(mcp_servers),
+            experimental_client_tools: Some(arguments.client_tools),
+            ..Default::default()
+        };
+
+        let cfg =
+            codex_core::config::Config::load_with_cli_overrides(Default::default(), overrides)?;
+
+        anyhow::Ok(cfg)
+    }
+
+    async fn handle_tool_call_acp_prompt(
+        &self,
+        request_id: RequestId,
+        arguments: Option<serde_json::Value>,
+    ) {
+        let (session_id, acp_session_id, prompt) = match Self::acp_prompt_arguments(arguments) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                tracing::warn!("Failed to parse rguments: {}", err);
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_owned(),
+                        text: format!("Failed to parse arguments: {err}"),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.outgoing
+                    .send_response(request_id, serde_json::to_value(result).unwrap_or_default())
+                    .await;
+                return;
+            }
+        };
+
+        let outgoing = self.outgoing.clone();
+        let session_map = self.session_map.clone();
+
+        let Some(session) = session_map.lock().await.get(&session_id).cloned() else {
+            tracing::warn!("Unknown session id: {}", session_id);
+            let result = CallToolResult {
+                content: vec![ContentBlock::TextContent(TextContent {
+                    r#type: "text".to_owned(),
+                    text: format!("Unknown session id: {session_id}"),
+                    annotations: None,
+                })],
+                is_error: Some(true),
+                structured_content: None,
+            };
+            self.outgoing
+                .send_response(request_id, serde_json::to_value(result).unwrap_or_default())
+                .await;
+            return;
+        };
+
+        let requests_codex_map = self.running_requests_id_to_codex_uuid.clone();
+
+        task::spawn(async move {
+            requests_codex_map
+                .lock()
+                .await
+                .insert(request_id.clone(), session_id);
+
+            let result =
+                crate::acp_tool_runner::prompt(acp_session_id, session, prompt, outgoing.clone())
+                    .await;
+
+            let result = match result {
+                Ok(()) => CallToolResult {
+                    content: vec![],
+                    is_error: Some(false),
+                    structured_content: None,
+                },
+                Err(err) => CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        annotations: None,
+                        text: err.to_string(),
+                        r#type: "text".to_owned(),
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                },
+            };
+
+            outgoing
+                .send_response(
+                    request_id.clone(),
+                    serde_json::to_value(result).unwrap_or_default(),
+                )
+                .await;
+
+            requests_codex_map.lock().await.remove(&request_id);
+        });
+    }
+
+    fn acp_prompt_arguments(
+        arguments: Option<serde_json::Value>,
+    ) -> anyhow::Result<(Uuid, acp::SessionId, Vec<acp::ContentBlock>)> {
+        let arguments = arguments.context("Arguments required")?;
+        let arguments = serde_json::from_value::<acp::PromptArguments>(arguments)?;
+
+        let session_id = Uuid::parse_str(&arguments.session_id.0)?;
+        Ok((session_id, arguments.session_id, arguments.prompt))
     }
 
     fn handle_set_level(

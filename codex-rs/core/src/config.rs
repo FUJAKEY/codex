@@ -143,6 +143,9 @@ pub struct Config {
 
     /// Experimental rollout resume path (absolute path to .jsonl; undocumented).
     pub experimental_resume: Option<PathBuf>,
+
+    /// Tools exposed by an IDE MCP server that can be used for richer operations
+    pub experimental_client_tools: Option<agent_client_protocol::ClientTools>,
 }
 
 impl Config {
@@ -366,13 +369,15 @@ pub struct ConfigOverrides {
     pub config_profile: Option<String>,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
     pub base_instructions: Option<String>,
+    pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
+    pub experimental_client_tools: Option<agent_client_protocol::ClientTools>,
 }
 
 impl Config {
     /// Meant to be used exclusively for tests: `load_with_overrides()` should
     /// be used in all other cases.
     pub fn load_from_base_config_with_overrides(
-        cfg: ConfigToml,
+        mut cfg: ConfigToml,
         overrides: ConfigOverrides,
         codex_home: PathBuf,
     ) -> std::io::Result<Self> {
@@ -388,6 +393,8 @@ impl Config {
             config_profile: config_profile_key,
             codex_linux_sandbox_exe,
             base_instructions,
+            mcp_servers: mcp_servers_override,
+            experimental_client_tools,
         } = overrides;
 
         let config_profile = match config_profile_key.as_ref().or(cfg.profile.as_ref()) {
@@ -469,6 +476,10 @@ impl Config {
             cfg.experimental_instructions_file.as_ref(),
         ));
 
+        if let Some(mcp_servers_override) = mcp_servers_override {
+            cfg.mcp_servers.extend(mcp_servers_override);
+        }
+
         let config = Self {
             model,
             model_context_window,
@@ -518,6 +529,7 @@ impl Config {
                 .unwrap_or("https://chatgpt.com/backend-api/".to_string()),
 
             experimental_resume,
+            experimental_client_tools,
         };
         Ok(config)
     }
@@ -841,6 +853,7 @@ disable_response_storage = true
                 chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
                 experimental_resume: None,
                 base_instructions: None,
+                experimental_client_tools: None,
             },
             o3_profile_config
         );
@@ -889,6 +902,7 @@ disable_response_storage = true
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             experimental_resume: None,
             base_instructions: None,
+            experimental_client_tools: None,
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -952,6 +966,7 @@ disable_response_storage = true
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             experimental_resume: None,
             base_instructions: None,
+            experimental_client_tools: None,
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);
