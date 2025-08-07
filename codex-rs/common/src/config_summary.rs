@@ -1,4 +1,5 @@
 use codex_core::WireApi;
+use codex_core::agents_doc_path_string;
 use codex_core::config::Config;
 
 use crate::sandbox_summary::summarize_sandbox_policy;
@@ -7,6 +8,10 @@ use crate::sandbox_summary::summarize_sandbox_policy;
 pub fn create_config_summary_entries(config: &Config) -> Vec<(&'static str, String)> {
     let mut entries = vec![
         ("workdir", config.cwd.display().to_string()),
+        (
+            "agents.md",
+            agents_doc_path_string(config).unwrap_or_else(|| "none".to_string()),
+        ),
         ("model", config.model.clone()),
         ("provider", config.model_provider_id.clone()),
         ("approval", config.approval_policy.to_string()),

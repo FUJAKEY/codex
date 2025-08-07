@@ -12,7 +12,10 @@
 //!     exists, the search stops – we do **not** walk past the Git root.
 
 use crate::config::Config;
+use std::fs;
+use std::io::Read as _;
 use std::path::Path;
+use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 use tracing::error;
 
@@ -49,6 +52,10 @@ pub(crate) async fn get_user_instructions(config: &Config) -> Option<String> {
 /// the function returns `Ok(None)`. Unexpected I/O failures bubble up as
 /// `Err` so callers can decide how to handle them.
 async fn find_project_doc(config: &Config) -> std::io::Result<Option<String>> {
+    if config.project_doc_max_bytes == 0 {
+        return Ok(None);
+    }
+
     let max_bytes = config.project_doc_max_bytes;
 
     // Attempt to load from the working directory first.
@@ -88,6 +95,124 @@ async fn find_project_doc(config: &Config) -> std::io::Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+/// Public helper that returns the discovered AGENTS.md path.
+/// Returns `Ok(None)` when no suitable file is found or `project_doc_max_bytes == 0`.
+pub fn discover_project_doc_path(config: &Config) -> std::io::Result<Option<std::path::PathBuf>> {
+    if config.project_doc_max_bytes == 0 {
+        return Ok(None);
+    }
+
+    discover_project_doc_path_from_dir(&config.cwd, CANDIDATE_FILENAMES)
+}
+
+fn discover_project_doc_path_from_dir(
+    start_dir: &Path,
+    names: &[&str],
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    // Canonicalize the path so that we do not end up in an infinite loop when
+    // `cwd` contains `..` components.
+    let mut dir = start_dir.to_path_buf();
+    if let Ok(canon) = dir.canonicalize() {
+        dir = canon;
+    }
+
+    // Attempt in the working directory first.
+    if let Some(path) = first_nonempty_candidate_in_dir(&dir, names) {
+        return Ok(Some(path));
+    }
+
+    // Walk up towards the filesystem root, stopping once we encounter the Git root.
+    while let Some(parent) = dir.parent() {
+        let git_marker = dir.join(".git");
+        let git_exists = match fs::metadata(&git_marker) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+
+        if git_exists {
+            if let Some(path) = first_nonempty_candidate_in_dir(&dir, names) {
+                return Ok(Some(path));
+            }
+            break; // do not walk past the Git root
+        }
+
+        dir = parent.to_path_buf();
+    }
+
+    Ok(None)
+}
+
+/// Return a human‑readable description of the AGENTS.md path(s) that will be
+/// loaded for this session, or `None` if neither global nor project docs are
+/// present.
+///
+/// This mirrors the discovery logic used by `get_user_instructions()`:
+/// - If `~/.codex/AGENTS.md` (global) is non‑empty, it is included.
+/// - If a project AGENTS.md is found (respecting the byte limit and git root
+///   stop), it is included.
+/// - When the project_doc_max_bytes is set to 0, project docs are disabled.
+pub fn agents_doc_path_string(config: &Config) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Global AGENTS.md in CODEX_HOME.
+    if config.user_instructions.is_some() {
+        let global = config.codex_home.join("AGENTS.md");
+        parts.push(global.display().to_string());
+    }
+
+    // Project AGENTS.md, unless disabled via byte‑limit == 0.
+    if config.project_doc_max_bytes > 0 {
+        if let Ok(Some(p)) = discover_project_doc_path(config) {
+            parts.push(p.display().to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" + "))
+    }
+}
+
+fn first_nonempty_candidate_in_dir(dir: &Path, names: &[&str]) -> Option<PathBuf> {
+    for name in names {
+        let candidate = dir.join(name);
+        // Fast path: must exist and be a file.
+        let md = match std::fs::metadata(&candidate) {
+            Ok(m) if m.is_file() => m,
+            _ => continue,
+        };
+
+        // If the file is zero bytes, skip without reading.
+        if md.len() == 0 {
+            continue;
+        }
+
+        // Read up to a modest limit to determine if the contents are effectively empty after trimming.
+        // Use the same limit as `project_doc_max_bytes` would permit by default.
+        const MAX_PEEK_BYTES: usize = 8 * 1024;
+        let mut file = match std::fs::File::open(&candidate) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut buf = Vec::with_capacity(std::cmp::min(md.len() as usize, MAX_PEEK_BYTES));
+        if std::io::Read::by_ref(&mut file)
+            .take(MAX_PEEK_BYTES as u64)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            continue;
+        }
+        let s = String::from_utf8_lossy(&buf);
+        if s.trim().is_empty() {
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
 }
 
 /// Attempt to load the first candidate file found in `dir`. Returns the file
@@ -232,6 +357,68 @@ mod tests {
         // Build config pointing at the nested dir.
         let mut cfg = make_config(&repo, 4096, None);
         cfg.cwd = nested;
+
+        let res = get_user_instructions(&cfg).await.expect("doc expected");
+        assert_eq!(res, "root level doc");
+    }
+
+    /// Test if AGENTS.md located in the current working directory is preferred over the repo root.
+    #[tokio::test]
+    async fn prefers_cwd_doc_over_repo_root() {
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        // Simulate a git repository at repo root.
+        std::fs::write(repo.path().join(".git"), "gitdir: /dev/null\n").unwrap();
+
+        // Create AGENTS.md at repo root and in a nested cwd.
+        fs::write(repo.path().join("AGENTS.md"), "root level doc").unwrap();
+        let nested = repo.path().join("workspace/crate_b");
+        std::fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("AGENTS.md"), "nested cwd doc").unwrap();
+
+        // Build config pointing at the nested dir.
+        let mut cfg = make_config(&repo, 4096, None);
+        cfg.cwd = nested.clone();
+
+        // Path discovery should prefer the nested cwd doc.
+        let discovered = super::discover_project_doc_path(&cfg)
+            .expect("discovery should succeed")
+            .expect("path should be found");
+        let discovered_canon = fs::canonicalize(&discovered).expect("canonicalize discovered");
+        let expected_canon =
+            fs::canonicalize(nested.join("AGENTS.md")).expect("canonicalize expected");
+        assert_eq!(discovered_canon, expected_canon);
+
+        // get_user_instructions should load the nested document contents.
+        let res = get_user_instructions(&cfg).await.expect("doc expected");
+        assert_eq!(res, "nested cwd doc");
+    }
+
+    /// Test if AGENTS.md at the repo root is used when none exists in cwd.
+    #[tokio::test]
+    async fn falls_back_to_repo_root_when_cwd_missing_doc() {
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        // Simulate a git repository at repo root.
+        std::fs::write(repo.path().join(".git"), "gitdir: /dev/null\n").unwrap();
+
+        // Create AGENTS.md only at repo root.
+        fs::write(repo.path().join("AGENTS.md"), "root level doc").unwrap();
+
+        // Nested cwd without its own AGENTS.md.
+        let nested = repo.path().join("nested/dir");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let mut cfg = make_config(&repo, 4096, None);
+        cfg.cwd = nested;
+
+        let discovered = super::discover_project_doc_path(&cfg)
+            .expect("discovery should succeed")
+            .expect("path should be found");
+        let discovered_canon = fs::canonicalize(&discovered).expect("canonicalize discovered");
+        let expected_canon =
+            fs::canonicalize(repo.path().join("AGENTS.md")).expect("canonicalize expected");
+        assert_eq!(discovered_canon, expected_canon);
 
         let res = get_user_instructions(&cfg).await.expect("doc expected");
         assert_eq!(res, "root level doc");

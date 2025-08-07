@@ -663,6 +663,10 @@ pub struct SessionConfiguredEvent {
     /// Tell the client what model is being queried.
     pub model: String,
 
+    /// The path(s) to AGENTS.md that were loaded for this session, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents_doc_path: Option<String>,
+
     /// Identifier of the history log file (inode on Unix, 0 otherwise).
     pub history_log_id: u64,
 
@@ -728,6 +732,7 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id,
                 model: "codex-mini-latest".to_string(),
+                agents_doc_path: None,
                 history_log_id: 0,
                 history_entry_count: 0,
             }),
