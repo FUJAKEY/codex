@@ -61,6 +61,7 @@ pub(crate) struct ChatComposer {
     pending_pastes: Vec<(String, String)>,
     token_usage_info: Option<TokenUsageInfo>,
     has_focus: bool,
+    auto_compact_enabled: bool,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -91,6 +92,7 @@ impl ChatComposer {
             pending_pastes: Vec::new(),
             token_usage_info: None,
             has_focus: has_input_focus,
+            auto_compact_enabled: false,
         }
     }
 
@@ -196,6 +198,10 @@ impl ChatComposer {
     pub fn set_ctrl_c_quit_hint(&mut self, show: bool, has_focus: bool) {
         self.ctrl_c_quit_hint = show;
         self.set_has_focus(has_focus);
+    }
+
+    pub(crate) fn set_auto_compact_enabled(&mut self, enabled: bool) {
+        self.auto_compact_enabled = enabled;
     }
 
     pub(crate) fn insert_str(&mut self, text: &str) {
@@ -719,9 +725,13 @@ impl WidgetRef for &ChatComposer {
                             100
                         };
                         hint.push(Span::from("   "));
+                        let style = if self.auto_compact_enabled && percent_remaining <= 20 {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default().add_modifier(Modifier::DIM)
+                        };
                         hint.push(
-                            Span::from(format!("{percent_remaining}% context left"))
-                                .style(Style::default().add_modifier(Modifier::DIM)),
+                            Span::from(format!("{percent_remaining}% context left")).style(style),
                         );
                     }
                 }
@@ -766,6 +776,10 @@ mod tests {
     use crate::bottom_pane::InputResult;
     use crate::bottom_pane::chat_composer::LARGE_PASTE_CHAR_THRESHOLD;
     use crate::bottom_pane::textarea::TextArea;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
+    use ratatui::widgets::WidgetRef;
 
     #[test]
     fn test_current_at_token_basic_cases() {
@@ -1306,5 +1320,91 @@ mod tests {
                 (false, 0), // After deleting from end
             ]
         );
+    }
+
+    #[test]
+    fn context_left_is_red_when_low_and_auto_compact_enabled() {
+        use crate::app_event::AppEvent;
+        use crate::bottom_pane::AppEventSender;
+        use codex_core::protocol::TokenUsage;
+
+        let (tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, sender, false);
+        composer.set_auto_compact_enabled(true);
+
+        let total = TokenUsage::default();
+        // Force 0% remaining (100 used of 100 window).
+        let last = TokenUsage { total_tokens: 100, ..Default::default() };
+        composer.set_token_usage(total, last, Some(100));
+
+        let area = Rect::new(0, 0, 100, 4);
+        let mut buf = Buffer::empty(area);
+        (&composer).render_ref(area, &mut buf);
+
+        // Inspect last row for the substring and verify it's red.
+        let y = area.y + area.height - 1;
+        let mut row = String::new();
+        for x in area.x..(area.x + area.width) {
+            if let Some(cell) = buf.cell((x, y)) {
+                row.push_str(cell.symbol());
+            }
+        }
+        let needle = "0% context left";
+        let idx = match row.find(needle) {
+            Some(i) => i,
+            None => {
+                panic!("expected hint substring present");
+            }
+        };
+        let start = idx as u16;
+        let x0 = area.x + start;
+        // Check a couple of chars for red fg (e.g., '0' and '%').
+        let fg0 = buf.cell((x0, y)).and_then(|c| c.style().fg);
+        let fg1 = buf.cell((x0 + 1, y)).and_then(|c| c.style().fg);
+        assert_eq!(fg0, Some(Color::Red));
+        assert_eq!(fg1, Some(Color::Red));
+    }
+
+    #[test]
+    fn context_left_is_dim_when_auto_compact_disabled() {
+        use crate::app_event::AppEvent;
+        use crate::bottom_pane::AppEventSender;
+        use codex_core::protocol::TokenUsage;
+
+        let (tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, sender, false);
+        composer.set_auto_compact_enabled(false);
+
+        let total = TokenUsage::default();
+        let last = TokenUsage { total_tokens: 100, ..Default::default() }; // 0% remaining
+        composer.set_token_usage(total, last, Some(100));
+
+        let area = Rect::new(0, 0, 100, 4);
+        let mut buf = Buffer::empty(area);
+        (&composer).render_ref(area, &mut buf);
+
+        let y = area.y + area.height - 1;
+        let mut row = String::new();
+        for x in area.x..(area.x + area.width) {
+            if let Some(cell) = buf.cell((x, y)) {
+                row.push_str(cell.symbol());
+            }
+        }
+        let needle = "0% context left";
+        let idx = match row.find(needle) {
+            Some(i) => i,
+            None => {
+                panic!("expected hint substring present");
+            }
+        };
+        let start = idx as u16;
+        let x0 = area.x + start;
+        // When auto-compact is disabled, the hint should not be red.
+        let fg0 = buf.cell((x0, y)).and_then(|c| c.style().fg);
+        let fg1 = buf.cell((x0 + 1, y)).and_then(|c| c.style().fg);
+        assert_ne!(fg0, Some(Color::Red));
+        assert_ne!(fg1, Some(Color::Red));
     }
 }

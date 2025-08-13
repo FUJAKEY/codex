@@ -73,6 +73,7 @@ pub(crate) struct ChatWidgetArgs {
     initial_prompt: Option<String>,
     initial_images: Vec<PathBuf>,
     enhanced_keys_supported: bool,
+    auto_compact: bool,
 }
 
 impl App<'_> {
@@ -81,6 +82,7 @@ impl App<'_> {
         initial_prompt: Option<String>,
         initial_images: Vec<std::path::PathBuf>,
         show_trust_screen: bool,
+        auto_compact: bool,
     ) -> Self {
         let (app_event_tx, app_event_rx) = channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
@@ -138,6 +140,7 @@ impl App<'_> {
                 initial_prompt,
                 initial_images,
                 enhanced_keys_supported,
+                auto_compact,
             };
             AppState::Onboarding {
                 screen: OnboardingScreen::new(OnboardingScreenArgs {
@@ -156,6 +159,7 @@ impl App<'_> {
                 initial_prompt,
                 initial_images,
                 enhanced_keys_supported,
+                auto_compact,
             );
             AppState::Chat {
                 widget: Box::new(chat_widget),
@@ -306,6 +310,7 @@ impl App<'_> {
                             None,
                             Vec::new(),
                             self.enhanced_keys_supported,
+                            false,
                         ));
                         self.app_state = AppState::Chat { widget: new_widget };
                         self.app_event_tx.send(AppEvent::RequestRedraw);
@@ -419,6 +424,7 @@ impl App<'_> {
                     enhanced_keys_supported,
                     initial_images,
                     initial_prompt,
+                    auto_compact,
                 }) => {
                     self.app_state = AppState::Chat {
                         widget: Box::new(ChatWidget::new(
@@ -427,6 +433,7 @@ impl App<'_> {
                             initial_prompt,
                             initial_images,
                             enhanced_keys_supported,
+                            auto_compact,
                         )),
                     }
                 }
