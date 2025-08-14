@@ -6,8 +6,12 @@ use tokio::process::Command;
 use tokio::time::Duration as TokioDuration;
 use tokio::time::timeout;
 
-/// Timeout for git commands to prevent freezing on large repositories
-const GIT_COMMAND_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
+/// Timeout for git commands to prevent freezing on large repositories.
+///
+/// Tests that wait for the initial `SessionConfigured` event use a short
+/// timeout (~1s). Collecting Git info is best-effort and must not block the
+/// session handshake, so we cap individual Git calls to a small value.
+const GIT_COMMAND_TIMEOUT: TokioDuration = TokioDuration::from_millis(400);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GitInfo {

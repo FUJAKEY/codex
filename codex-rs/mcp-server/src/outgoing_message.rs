@@ -266,6 +266,7 @@ mod tests {
                 model: "gpt-4o".to_string(),
                 history_log_id: 1,
                 history_entry_count: 1000,
+                git_info: None,
             }),
         };
 
@@ -306,6 +307,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             history_log_id: 1,
             history_entry_count: 1000,
+            git_info: None,
         };
         let event = Event {
             id: "1".to_string(),

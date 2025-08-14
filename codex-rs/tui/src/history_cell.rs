@@ -243,12 +243,25 @@ impl HistoryCell {
             session_id: _,
             history_log_id: _,
             history_entry_count: _,
+            git_info,
         } = event;
         if is_first_event {
             let cwd_str = match relativize_to_home(&config.cwd) {
                 Some(rel) if !rel.as_os_str().is_empty() => format!("~/{}", rel.display()),
                 Some(_) => "~".to_string(),
                 None => config.cwd.display().to_string(),
+            };
+
+            // Use async-collected Git info from the event if available.
+            let branch_suffix = git_info
+                .and_then(|g| g.branch)
+                .map(|b| format!(" ({b})"))
+                .unwrap_or_default();
+
+            let path_and_branch = if branch_suffix.is_empty() {
+                format!(" {cwd_str}")
+            } else {
+                format!(" {cwd_str}{branch_suffix}")
             };
 
             let lines: Vec<Line<'static>> = vec![
@@ -258,7 +271,7 @@ impl HistoryCell {
                         "You are using OpenAI Codex in",
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(format!(" {cwd_str}")).dim(),
+                    Span::raw(path_and_branch).dim(),
                 ]),
                 Line::from("".dim()),
                 Line::from(" To get started, describe a task or try one of these commands:".dim()),
@@ -910,6 +923,8 @@ impl HistoryCell {
         }
     }
 }
+
+//
 
 impl WidgetRef for &HistoryCell {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
