@@ -329,6 +329,7 @@ impl ChatComposer {
                     self.dismissed_file_popup_token = Some(tok.to_string());
                 }
                 self.active_popup = ActivePopup::None;
+                self.app_event_tx.send(AppEvent::StopFileSearch);
                 (InputResult::None, true)
             }
             KeyEvent {
@@ -344,6 +345,7 @@ impl ChatComposer {
                     // Drop popup borrow before using self mutably again.
                     self.insert_selected_path(&sel_path);
                     self.active_popup = ActivePopup::None;
+                    self.app_event_tx.send(AppEvent::StopFileSearch);
                     return (InputResult::None, true);
                 }
                 (InputResult::None, false)
@@ -595,6 +597,8 @@ impl ChatComposer {
             None => {
                 self.active_popup = ActivePopup::None;
                 self.dismissed_file_popup_token = None;
+                // No active @token under cursor; stop any search.
+                self.app_event_tx.send(AppEvent::StopFileSearch);
                 return;
             }
         };
@@ -604,26 +608,16 @@ impl ChatComposer {
             return;
         }
 
-        if !query.is_empty() {
-            self.app_event_tx
-                .send(AppEvent::StartFileSearch(query.clone()));
-        }
+        self.app_event_tx
+            .send(AppEvent::StartFileSearch(query.clone()));
 
         match &mut self.active_popup {
             ActivePopup::File(popup) => {
-                if query.is_empty() {
-                    popup.set_empty_prompt();
-                } else {
-                    popup.set_query(&query);
-                }
+                popup.set_query(&query);
             }
             _ => {
                 let mut popup = FileSearchPopup::new();
-                if query.is_empty() {
-                    popup.set_empty_prompt();
-                } else {
-                    popup.set_query(&query);
-                }
+                popup.set_query(&query);
                 self.active_popup = ActivePopup::File(popup);
             }
         }

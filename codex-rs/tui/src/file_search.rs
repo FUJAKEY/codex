@@ -51,7 +51,7 @@ pub(crate) struct FileSearchManager {
 
 struct SearchState {
     /// Latest query typed by user (updated every keystroke).
-    latest_query: String,
+    latest_query: Option<String>,
 
     /// true if a search is currently scheduled.
     is_search_scheduled: bool,
@@ -69,7 +69,7 @@ impl FileSearchManager {
     pub fn new(search_dir: PathBuf, tx: AppEventSender) -> Self {
         Self {
             state: Arc::new(Mutex::new(SearchState {
-                latest_query: String::new(),
+                latest_query: None,
                 is_search_scheduled: false,
                 active_search: None,
             })),
@@ -83,14 +83,13 @@ impl FileSearchManager {
         {
             #[expect(clippy::unwrap_used)]
             let mut st = self.state.lock().unwrap();
-            if query == st.latest_query {
-                // No change, nothing to do.
+            // If the query hasn't changed, nothing to do.
+            if st.latest_query.as_deref() == Some(query.as_str()) {
                 return;
             }
 
             // Update latest query.
-            st.latest_query.clear();
-            st.latest_query.push_str(&query);
+            st.latest_query = Some(query.clone());
 
             // If there is an in-flight search that is definitely obsolete,
             // cancel it now.
@@ -131,28 +130,57 @@ impl FileSearchManager {
 
             // The debounce timer has expired, so start a search using the
             // latest query.
-            let cancellation_token = Arc::new(AtomicBool::new(false));
-            let token = cancellation_token.clone();
-            let query = {
+            let latest_query_opt = {
                 #[expect(clippy::unwrap_used)]
                 let mut st = state.lock().unwrap();
                 let query = st.latest_query.clone();
                 st.is_search_scheduled = false;
-                st.active_search = Some(ActiveSearch {
-                    query: query.clone(),
-                    cancellation_token: token,
-                });
                 query
             };
 
-            FileSearchManager::spawn_file_search(
-                query,
-                search_dir,
-                tx_clone,
-                cancellation_token,
-                state,
-            );
+            let Some(query) = latest_query_opt else {
+                return;
+            };
+
+            if query.is_empty() {
+                // Quick, synchronous top-level suggestions for empty query.
+                let max_total = MAX_FILE_SEARCH_RESULTS.get();
+                let matches = collect_top_level_suggestions(&search_dir, max_total);
+                tx_clone.send(AppEvent::FileSearchResult { query, matches });
+            } else {
+                // Full-text file search for non-empty query.
+                let cancellation_token = Arc::new(AtomicBool::new(false));
+                let token = cancellation_token.clone();
+                {
+                    #[expect(clippy::unwrap_used)]
+                    let mut st = state.lock().unwrap();
+                    st.active_search = Some(ActiveSearch {
+                        query: query.clone(),
+                        cancellation_token: token,
+                    });
+                }
+
+                FileSearchManager::spawn_file_search(
+                    query,
+                    search_dir,
+                    tx_clone,
+                    cancellation_token,
+                    state,
+                );
+            }
         });
+    }
+
+    /// Reset any scheduled or active search and clear the last query.
+    pub fn reset(&self) {
+        #[expect(clippy::unwrap_used)]
+        let mut st = self.state.lock().unwrap();
+        st.latest_query = None;
+        st.is_search_scheduled = false;
+        if let Some(active) = &st.active_search {
+            active.cancellation_token.store(true, Ordering::Relaxed);
+        }
+        st.active_search = None;
     }
 
     fn spawn_file_search(
@@ -194,5 +222,94 @@ impl FileSearchManager {
                 }
             }
         });
+    }
+}
+
+/// Build a small, fast set of suggestions for an empty `@` mention.
+/// Strategy: list top-level non-hidden files first, then top-level directories
+/// (with trailing '/'), capped by `max_total`.
+fn collect_top_level_suggestions(
+    cwd: &std::path::Path,
+    max_total: usize,
+) -> Vec<file_search::FileMatch> {
+    use std::collections::HashSet;
+    use std::fs;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<file_search::FileMatch> = Vec::new();
+    let mut total_added: usize = 0;
+
+    // 1) Top-level non-hidden files in cwd (files only).
+    if let Ok(rd) = fs::read_dir(cwd) {
+        for entry in rd.flatten() {
+            if total_added >= max_total {
+                break;
+            }
+            let path = entry.path();
+            let file_name = match path.strip_prefix(cwd).ok().and_then(|p| p.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            if file_name.starts_with('.') {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(ft) if ft.is_file() => {
+                    push_mention_path(&mut out, &mut seen, &mut total_added, file_name.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 2) If still under cap, add top-level non-hidden directories (with trailing '/').
+    if total_added < max_total {
+        if let Ok(rd) = fs::read_dir(cwd) {
+            for entry in rd.flatten() {
+                if total_added >= max_total {
+                    break;
+                }
+                let path = entry.path();
+                let file_name = match path.strip_prefix(cwd).ok().and_then(|p| p.to_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if file_name.starts_with('.') {
+                    continue;
+                }
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_dir() {
+                        push_mention_path(
+                            &mut out,
+                            &mut seen,
+                            &mut total_added,
+                            format!("{file_name}/"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if total_added > max_total {
+        out.truncate(max_total);
+    }
+    out
+}
+
+/// Insert a suggestion if not seen yet; updates `total_added` and returns true when inserted.
+fn push_mention_path(
+    out: &mut Vec<file_search::FileMatch>,
+    seen: &mut std::collections::HashSet<String>,
+    total_added: &mut usize,
+    rel: String,
+) {
+    if seen.insert(rel.clone()) {
+        out.push(file_search::FileMatch {
+            score: 0,
+            path: rel,
+            indices: None,
+        });
+        *total_added += 1;
     }
 }
