@@ -356,6 +356,9 @@ impl ChatWidget {
     }
 
     fn on_web_search_begin(&mut self, ev: WebSearchBeginEvent) {
+        if ev.query.trim() == "Searching Web..." {
+            return;
+        }
         self.flush_answer_stream_with_separator();
         self.add_to_history(history_cell::new_web_search_call(ev.query));
     }

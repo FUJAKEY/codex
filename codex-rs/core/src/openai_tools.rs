@@ -66,6 +66,7 @@ pub(crate) struct ToolsConfig {
     pub shell_type: ConfigShellToolType,
     pub plan_tool: bool,
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
+    #[allow(dead_code)]
     pub web_search_request: bool,
     pub include_view_image_tool: bool,
 }
@@ -326,6 +327,27 @@ pub(crate) struct ApplyPatchToolArgs {
     pub(crate) input: String,
 }
 
+fn create_web_search_request_tool() -> OpenAiTool {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "query".to_string(),
+        JsonSchema::String {
+            description: Some("The search query".to_string()),
+        },
+    );
+    OpenAiTool::Function(ResponsesApiTool {
+        name: "web_search_request".to_string(),
+        description: "Request user approval to perform a web search with the given query. If approved, you must call the native web_search (or web.run) tool on your next turn using the approved query before answering."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["query".to_string()]),
+            additional_properties: Some(false),
+        },
+    })
+}
+
 /// Returns JSON values that are compatible with Function Calling in the
 /// Responses API:
 /// https://platform.openai.com/docs/guides/function-calling?api-mode=responses
@@ -565,9 +587,8 @@ pub(crate) fn get_openai_tools(
         }
     }
 
-    if config.web_search_request {
-        tools.push(OpenAiTool::WebSearch {});
-    }
+    // Always expose the per-call web search approval function tool by default.
+    tools.push(create_web_search_request_tool());
 
     // Include the view_image tool so the agent can attach images to context.
     if config.include_view_image_tool {
@@ -643,7 +664,7 @@ mod tests {
 
         assert_eq_tool_names(
             &tools,
-            &["local_shell", "update_plan", "web_search", "view_image"],
+            &["local_shell", "update_plan", "web_search_request", "view_image"],
         );
     }
 
@@ -664,7 +685,7 @@ mod tests {
 
         assert_eq_tool_names(
             &tools,
-            &["shell", "update_plan", "web_search", "view_image"],
+            &["shell", "update_plan", "web_search_request", "view_image"],
         );
     }
 
@@ -723,7 +744,7 @@ mod tests {
             &tools,
             &[
                 "shell",
-                "web_search",
+                "web_search_request",
                 "view_image",
                 "test_server/do_something_cool",
             ],
@@ -837,11 +858,12 @@ mod tests {
         ]);
 
         let tools = get_openai_tools(&config, Some(tools_map));
-        // Expect shell first, followed by MCP tools sorted by fully-qualified name.
+        // Expect shell first, then search approval tool, then MCP tools sorted by name.
         assert_eq_tool_names(
             &tools,
             &[
                 "shell",
+                "web_search_request",
                 "view_image",
                 "test_server/cool",
                 "test_server/do",
@@ -889,7 +911,7 @@ mod tests {
 
         assert_eq_tool_names(
             &tools,
-            &["shell", "web_search", "view_image", "dash/search"],
+            &["shell", "web_search_request", "view_image", "dash/search"],
         );
 
         assert_eq!(
@@ -949,7 +971,7 @@ mod tests {
 
         assert_eq_tool_names(
             &tools,
-            &["shell", "web_search", "view_image", "dash/paginate"],
+            &["shell", "web_search_request", "view_image", "dash/paginate"],
         );
         assert_eq!(
             tools[3],
@@ -1004,7 +1026,10 @@ mod tests {
             )])),
         );
 
-        assert_eq_tool_names(&tools, &["shell", "web_search", "view_image", "dash/tags"]);
+        assert_eq_tool_names(
+            &tools,
+            &["shell", "web_search_request", "view_image", "dash/tags"],
+        );
         assert_eq!(
             tools[3],
             OpenAiTool::Function(ResponsesApiTool {
@@ -1061,7 +1086,10 @@ mod tests {
             )])),
         );
 
-        assert_eq_tool_names(&tools, &["shell", "web_search", "view_image", "dash/value"]);
+        assert_eq_tool_names(
+            &tools,
+            &["shell", "web_search_request", "view_image", "dash/value"],
+        );
         assert_eq!(
             tools[3],
             OpenAiTool::Function(ResponsesApiTool {
