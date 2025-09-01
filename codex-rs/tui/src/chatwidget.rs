@@ -7,6 +7,7 @@ use codex_core::config::Config;
 use codex_core::config_types::Notifications;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::local_git_branches;
+use codex_core::git_info;
 use codex_core::protocol::AgentMessageDeltaEvent;
 use codex_core::protocol::AgentMessageEvent;
 use codex_core::protocol::AgentReasoningDeltaEvent;
@@ -821,7 +822,7 @@ impl ChatWidget {
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
         let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), conversation_manager);
 
-        Self {
+        let widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
             codex_op_tx,
@@ -859,6 +860,11 @@ impl ChatWidget {
             ghost_snapshots: Vec::new(),
             ghost_snapshots_disabled: true,
         }
+        };
+
+        // Update repository information for status display asynchronously
+        widget.spawn_repo_info_task();
+        widget
     }
 
     /// Create a ChatWidget attached to an existing conversation (e.g., a fork).
@@ -882,7 +888,7 @@ impl ChatWidget {
         let codex_op_tx =
             spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone());
 
-        Self {
+        let widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
             codex_op_tx,
@@ -920,6 +926,11 @@ impl ChatWidget {
             ghost_snapshots: Vec::new(),
             ghost_snapshots_disabled: true,
         }
+        };
+
+        // Update repository information for status display asynchronously
+        widget.spawn_repo_info_task();
+        widget
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
@@ -1912,6 +1923,36 @@ impl ChatWidget {
     /// runtime overrides applied via TUI, e.g., model or approval policy).
     pub(crate) fn config_ref(&self) -> &Config {
         &self.config
+    }
+
+    /// Spawn a background task to collect repo/branch and post an AppEvent.
+    pub(crate) fn spawn_repo_info_task(&self) {
+        let cwd = self.config.cwd.clone();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let info = git_info::collect_git_info(&cwd).await;
+            if let Some(info) = info {
+                let repo_name = git_info::extract_repo_name(&cwd);
+                tx.send(crate::app_event::AppEvent::UpdateRepoInfo {
+                    repo_name: Some(repo_name),
+                    git_branch: info.branch,
+                });
+            } else {
+                tx.send(crate::app_event::AppEvent::UpdateRepoInfo {
+                    repo_name: None,
+                    git_branch: None,
+                });
+            }
+        });
+    }
+
+    /// Apply repository info to the UI.
+    pub(crate) fn apply_repo_info(
+        &mut self,
+        repo_name: Option<String>,
+        git_branch: Option<String>,
+    ) {
+        self.bottom_pane.set_repo_info(repo_name, git_branch);
     }
 
     pub(crate) fn clear_token_usage(&mut self) {
