@@ -2,6 +2,7 @@
 use std::path::PathBuf;
 
 use crate::app_event_sender::AppEventSender;
+use crate::notifications;
 use crate::tui::FrameRequester;
 use crate::user_approval_widget::ApprovalRequest;
 use bottom_pane_view::BottomPaneView;
@@ -97,6 +98,16 @@ impl BottomPane {
             queued_user_messages: Vec::new(),
             esc_backtrack_hint: false,
         }
+    }
+
+    /// Update whether the bottom pane's composer has input focus.
+    pub(crate) fn set_has_input_focus(&mut self, has_focus: bool) {
+        self.has_input_focus = has_focus;
+        // Use existing API to propagate focus to the composer without changing the
+        // current Ctrl-C hint visibility.
+        self.composer
+            .set_ctrl_c_quit_hint(self.ctrl_c_quit_hint, self.has_input_focus);
+        self.request_redraw();
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
@@ -371,6 +382,29 @@ impl BottomPane {
 
     /// Called when the agent requests user approval.
     pub fn push_approval_request(&mut self, request: ApprovalRequest) {
+        if !self.has_input_focus {
+            // Send a system notification whenever an approval dialog is about to be shown.
+            match &request {
+                ApprovalRequest::Exec { command, .. } => {
+                    let preview = command.join(" ");
+                    let msg = format!("Approve \"{preview}\"?");
+                    notifications::send_os_notification(&msg);
+                }
+                ApprovalRequest::ApplyPatch {
+                    reason, grant_root, ..
+                } => {
+                    let msg = if let Some(root) = grant_root {
+                        format!("Approve patch changes? Grant write to {}", root.display())
+                    } else if let Some(r) = reason {
+                        format!("Approve patch changes? {r}")
+                    } else {
+                        "Approve patch changes?".to_string()
+                    };
+                    notifications::send_os_notification(&msg);
+                }
+            }
+        }
+
         let request = if let Some(view) = self.active_view.as_mut() {
             match view.try_consume_approval_request(request) {
                 Some(request) => request,

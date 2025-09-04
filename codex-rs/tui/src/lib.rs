@@ -46,6 +46,7 @@ mod key_hint;
 pub mod live_wrap;
 mod markdown;
 mod markdown_stream;
+mod notifications;
 pub mod onboarding;
 mod pager_overlay;
 mod render;
