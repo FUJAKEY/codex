@@ -52,6 +52,9 @@ pub(crate) struct App {
 
     // Esc-backtracking state grouped
     pub(crate) backtrack: crate::app_backtrack::BacktrackState,
+
+    // Whether the terminal has focus (tracked via TuiEvent::FocusChanged)
+    pub(crate) app_focused: Arc<AtomicBool>,
 }
 
 impl App {
@@ -95,6 +98,7 @@ impl App {
             has_emitted_history_lines: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             backtrack: BacktrackState::default(),
+            app_focused: Arc::new(AtomicBool::new(true)),
         };
 
         let tui_events = tui.event_stream();
@@ -125,6 +129,10 @@ impl App {
             match event {
                 TuiEvent::Key(key_event) => {
                     self.handle_key_event(tui, key_event).await;
+                }
+                TuiEvent::FocusChanged(focused) => {
+                    self.chat_widget.set_input_focus(focused);
+                    self.app_focused.store(focused, Ordering::Relaxed);
                 }
                 TuiEvent::Paste(pasted) => {
                     // Many terminals convert newlines to \r when pasting (e.g., iTerm2),
