@@ -38,13 +38,25 @@ impl StreamState {
 pub(crate) struct HeaderEmitter {
     emitted_this_turn: bool,
     emitted_in_stream: bool,
+    label: HeaderLabel,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum HeaderLabel {
+    Codex,
+    Thinking,
 }
 
 impl HeaderEmitter {
     pub(crate) fn new() -> Self {
+        Self::with_label(HeaderLabel::Codex)
+    }
+
+    pub(crate) fn with_label(label: HeaderLabel) -> Self {
         Self {
             emitted_this_turn: false,
             emitted_in_stream: false,
+            label,
         }
     }
 
@@ -70,5 +82,18 @@ impl HeaderEmitter {
         } else {
             false
         }
+    }
+
+    /// Return the configured label for this emitter (e.g., Codex or Thinking).
+    pub(crate) fn current_label(&self) -> HeaderLabel {
+        self.label
+    }
+}
+
+pub(crate) fn render_header_line(label: HeaderLabel) -> ratatui::text::Line<'static> {
+    use ratatui::style::Stylize;
+    match label {
+        HeaderLabel::Codex => ratatui::text::Line::from("codex".magenta().bold()),
+        HeaderLabel::Thinking => ratatui::text::Line::from("thinking".magenta().italic()),
     }
 }

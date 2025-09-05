@@ -4,6 +4,7 @@ use crate::exec_command::strip_bash_lc_and_escape;
 use crate::markdown::append_markdown;
 use crate::render::line_utils::prefix_lines;
 use crate::slash_command::SlashCommand;
+use crate::streaming::HeaderLabel;
 use crate::text_formatting::format_and_truncate_tool_result;
 use base64::Engine;
 use codex_ansi_escape::ansi_escape_line;
@@ -119,13 +120,15 @@ impl HistoryCell for UserHistoryCell {
 pub(crate) struct AgentMessageCell {
     lines: Vec<Line<'static>>,
     is_first_line: bool,
+    header_label: HeaderLabel,
 }
 
 impl AgentMessageCell {
-    pub(crate) fn new(lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
+    pub(crate) fn new(lines: Vec<Line<'static>>, is_first_line: bool, header_label: HeaderLabel) -> Self {
         Self {
             lines,
             is_first_line,
+            header_label,
         }
     }
 }
@@ -133,21 +136,39 @@ impl AgentMessageCell {
 impl HistoryCell for AgentMessageCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
-        // We want:
-        // - First visual line: "> " prefix (collapse with header logic)
-        // - All subsequent visual lines: two-space prefix
+        // For live reasoning streams, include an explicit visible header line.
+        if self.is_first_line && matches!(self.header_label, HeaderLabel::Thinking) {
+            out.push(crate::streaming::render_header_line(self.header_label));
+        }
+        // Handle different prefixes based on header label:
+        // - Thinking streams: no prefix (clean left-aligned display)
+        // - Codex streams: "> " prefix for first line, "  " for subsequent
+        let first_line_marker: Span<'static> = if matches!(self.header_label, HeaderLabel::Thinking) {
+            "".into()
+        } else {
+            "> ".into()
+        };
+        let continuation_marker: Span<'static> = if matches!(self.header_label, HeaderLabel::Thinking) {
+            "".into()
+        } else {
+            "  ".into()
+        };
+        
         let mut is_first_visual = true;
-        let wrap_width = width.saturating_sub(2); // account for prefix
+        let prefix_width = if matches!(self.header_label, HeaderLabel::Thinking) { 0 } else { 2 };
+        let wrap_width = width.saturating_sub(prefix_width); // account for prefix
         for line in &self.lines {
             let wrapped =
                 crate::insert_history::word_wrap_lines(std::slice::from_ref(line), wrap_width);
             for (i, piece) in wrapped.into_iter().enumerate() {
                 let mut spans = Vec::with_capacity(piece.spans.len() + 1);
-                spans.push(if is_first_visual && i == 0 && self.is_first_line {
-                    "> ".into()
-                } else {
-                    "  ".into()
-                });
+                if !matches!(self.header_label, HeaderLabel::Thinking) {
+                    spans.push(if is_first_visual && i == 0 && self.is_first_line {
+                        first_line_marker.clone()
+                    } else {
+                        continuation_marker.clone()
+                    });
+                }
                 spans.extend(piece.spans.into_iter());
                 out.push(spans.into());
             }
@@ -159,7 +180,10 @@ impl HistoryCell for AgentMessageCell {
     fn transcript_lines(&self) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         if self.is_first_line {
-            out.push("codex".magenta().bold().into());
+            match self.header_label {
+                HeaderLabel::Thinking => out.push("thinking".magenta().italic().into()),
+                HeaderLabel::Codex => out.push("codex".magenta().bold().into()),
+            }
         }
         out.extend(self.lines.clone());
         out
@@ -1272,7 +1296,9 @@ pub(crate) fn new_reasoning_summary_block(
                         Box::new(TranscriptOnlyHistoryCell {
                             lines: header_lines,
                         }),
-                        Box::new(AgentMessageCell::new(summary_lines, true)),
+                        // Render the summary under the regular agent (codex) header in transcript
+                        // and visible history, while keeping the "Thinking" line as content.
+                        Box::new(AgentMessageCell::new(summary_lines, true, HeaderLabel::Codex)),
                     ];
                 }
             }

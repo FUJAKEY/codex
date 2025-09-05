@@ -4,6 +4,7 @@ use codex_core::config::Config;
 use ratatui::text::Line;
 
 use super::HeaderEmitter;
+use super::HeaderLabel;
 use super::StreamState;
 
 /// Sink for history insertions and animation control.
@@ -47,6 +48,17 @@ impl StreamController {
         Self {
             config,
             header: HeaderEmitter::new(),
+            state: StreamState::new(),
+            active: false,
+            finishing_after_drain: false,
+        }
+    }
+
+    /// Create a stream controller with a specific header label (e.g., "thinking").
+    pub(crate) fn with_label(config: Config, label: HeaderLabel) -> Self {
+        Self {
+            config,
+            header: HeaderEmitter::with_label(label),
             state: StreamState::new(),
             active: false,
             finishing_after_drain: false,
@@ -126,6 +138,7 @@ impl StreamController {
                 sink.insert_history_cell(Box::new(history_cell::AgentMessageCell::new(
                     out_lines,
                     self.header.maybe_emit_header(),
+                    self.header.current_label(),
                 )));
             }
 
@@ -161,6 +174,7 @@ impl StreamController {
             sink.insert_history_cell(Box::new(history_cell::AgentMessageCell::new(
                 step.history,
                 self.header.maybe_emit_header(),
+                self.header.current_label(),
             )));
         }
 
