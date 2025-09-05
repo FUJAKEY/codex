@@ -34,6 +34,7 @@ use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::textarea::TextArea;
 use crate::bottom_pane::textarea::TextAreaState;
+use crate::clipboard_paste::clipboard_text_fastpath;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
 use crate::key_hint;
@@ -44,6 +45,22 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+
+#[cfg(windows)]
+fn flush_windows_console_input_buffer() {
+    use windows_sys::Win32::System::Console::FlushConsoleInputBuffer;
+    use windows_sys::Win32::System::Console::GetStdHandle;
+    use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        if (h as isize) != -1 && (h as isize) != 0 {
+            let _ = FlushConsoleInputBuffer(h);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn flush_windows_console_input_buffer() {}
 
 /// If the pasted content exceeds this number of characters, replace it with a
 /// placeholder in the UI.
@@ -894,6 +911,23 @@ impl ChatComposer {
                 match self.paste_burst.on_plain_char(ch, now) {
                     CharDecision::BufferAppend => {
                         self.paste_burst.append_char_to_buffer(ch, now);
+                        
+                        // Windows-only fast path: try to fetch full clipboard text
+                        #[cfg(windows)]
+                        if let Some(cb_text) = clipboard_text_fastpath() {
+                            if cb_text.chars().count() >= LARGE_PASTE_CHAR_THRESHOLD {
+                                // Clear the paste burst state since we're handling this immediately
+                                self.paste_burst.clear_after_explicit_paste();
+                                
+                                // Immediately process the full paste content 
+                                let _ = self.handle_paste(cb_text);
+                                
+                                // Flush the console input buffer so the user can act immediately.
+                                flush_windows_console_input_buffer();
+                                return (InputResult::None, true);
+                            }
+                        }
+                        
                         return (InputResult::None, true);
                     }
                     CharDecision::BeginBuffer { retro_chars } => {
@@ -908,8 +942,30 @@ impl ChatComposer {
                             if !grab.grabbed.is_empty() {
                                 self.textarea.replace_range(grab.start_byte..safe_cur, "");
                             }
-                            self.paste_burst.begin_with_retro_grabbed(grab.grabbed, now);
+                            self.paste_burst.begin_with_retro_grabbed(grab.grabbed.clone(), now);
                             self.paste_burst.append_char_to_buffer(ch, now);
+
+                            // Windows-only fast path: try to fetch full clipboard text and render
+                            // placeholder with final char count immediately, then swallow keystream.
+                            let initial = format!("{}{}", grab.grabbed, ch);
+                            #[cfg(windows)]
+                            if let Some(cb_text) = clipboard_text_fastpath() {
+                                // Only fast-path if clipboard begins with the text already seen.
+                                if cb_text.starts_with(&initial)
+                                    && cb_text.chars().count() >= LARGE_PASTE_CHAR_THRESHOLD
+                                {
+                                    // Clear the paste burst state since we're handling this immediately
+                                    self.paste_burst.clear_after_explicit_paste();
+                                    
+                                    // Immediately process the full paste content 
+                                    let _ = self.handle_paste(cb_text);
+                                    
+                                    // Flush the console input buffer so the user can act immediately.
+                                    flush_windows_console_input_buffer();
+                                    return (InputResult::None, true);
+                                }
+                            }
+
                             return (InputResult::None, true);
                         }
                         // If decide_begin_buffer opted not to start buffering,
@@ -918,6 +974,24 @@ impl ChatComposer {
                     CharDecision::BeginBufferFromPending => {
                         // First char was held; now append the current one.
                         self.paste_burst.append_char_to_buffer(ch, now);
+                        
+                        // Windows-only fast path: try to fetch full clipboard text
+                        #[cfg(windows)]
+                        if let Some(cb_text) = clipboard_text_fastpath() {
+                            // We know the buffer should contain at least 2 chars at this point
+                            if cb_text.chars().count() >= LARGE_PASTE_CHAR_THRESHOLD {
+                                // Clear the paste burst state since we're handling this immediately
+                                self.paste_burst.clear_after_explicit_paste();
+                                
+                                // Immediately process the full paste content 
+                                let _ = self.handle_paste(cb_text);
+                                
+                                // Flush the console input buffer so the user can act immediately.
+                                flush_windows_console_input_buffer();
+                                return (InputResult::None, true);
+                            }
+                        }
+                        
                         return (InputResult::None, true);
                     }
                     CharDecision::RetainFirstChar => {

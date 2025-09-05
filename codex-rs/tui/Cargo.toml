@@ -92,6 +92,9 @@ pathdiff = "0.2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_Console"] }
+
 # Clipboard support via `arboard` is not available on Android/Termux.
 # Only include it for non-Android targets so the crate builds on Android.
 [target.'cfg(not(target_os = "android"))'.dependencies]

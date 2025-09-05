@@ -108,12 +108,26 @@ pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImag
     Ok((path, info))
 }
 
+/// Windows-only: try to fetch clipboard text for paste fast path.
+/// On non-Windows platforms, returns None so code paths remain unchanged.
+#[cfg(windows)]
+pub fn clipboard_text_fastpath() -> Option<String> {
+    // Best-effort: if clipboard is unavailable or empty, fall back silently.
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+#[cfg(not(windows))]
+pub fn clipboard_text_fastpath() -> Option<String> {
+    None
+}
+
 #[cfg(target_os = "android")]
 pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImageError> {
     // Keep error consistent with paste_image_as_png.
     Err(PasteImageError::ClipboardUnavailable(
         "clipboard image paste is unsupported on Android".into(),
     ))
+}
 }
 
 /// Normalize pasted text that may represent a filesystem path.
