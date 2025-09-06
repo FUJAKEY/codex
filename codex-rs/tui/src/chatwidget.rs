@@ -80,6 +80,7 @@ use codex_common::approval_presets::builtin_approval_presets;
 use codex_common::model_presets::ModelPreset;
 use codex_common::model_presets::builtin_model_presets;
 use codex_core::ConversationManager;
+use codex_core::config_types::MessageDuringTurnBehavior;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
@@ -130,6 +131,7 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
+    // No TUI-level tracking; core decides mid-tool-call behavior.
 }
 
 struct UserMessage {
@@ -294,10 +296,10 @@ impl ChatWidget {
     /// When there are queued user messages, restore them into the composer
     /// separated by newlines rather than auto‑submitting the next one.
     fn on_interrupted_turn(&mut self) {
-        // Finalize, log a gentle prompt, and clear running state.
+        // User-initiated interrupt: finalize with a gentle prompt
+        // and restore any queued messages into the composer.
         self.finalize_turn_with_error_message("Tell the model what to do differently".to_owned());
 
-        // If any messages were queued during the task, restore them into the composer.
         if !self.queued_user_messages.is_empty() {
             let combined = self
                 .queued_user_messages
@@ -306,7 +308,6 @@ impl ChatWidget {
                 .collect::<Vec<_>>()
                 .join("\n");
             self.bottom_pane.set_composer_text(combined);
-            // Clear the queue and update the status indicator list.
             self.queued_user_messages.clear();
             self.refresh_queued_user_messages();
         }
@@ -365,6 +366,7 @@ impl ChatWidget {
             |q| q.push_patch_end(event),
             |s| s.handle_patch_apply_end_now(ev2),
         );
+        // No TUI-level tracking
     }
 
     fn on_exec_command_end(&mut self, ev: ExecCommandEndEvent) {
@@ -780,14 +782,24 @@ impl ChatWidget {
             _ => {
                 match self.bottom_pane.handle_key_event(key_event) {
                     InputResult::Submitted(text) => {
-                        // If a task is running, queue the user input to be sent after the turn completes.
+                        // Build the message to submit or defer.
                         let user_message = UserMessage {
                             text,
                             image_paths: self.bottom_pane.take_recent_submission_images(),
                         };
                         if self.bottom_pane.is_task_running() {
-                            self.queued_user_messages.push_back(user_message);
-                            self.refresh_queued_user_messages();
+                            match self.config.tui.message_during_turn_behavior {
+                                MessageDuringTurnBehavior::Queue => {
+                                    // Original behavior: queue for after the turn completes.
+                                    self.queued_user_messages.push_back(user_message);
+                                    self.refresh_queued_user_messages();
+                                }
+                                MessageDuringTurnBehavior::Interrupt => {
+                                    // Forward to Codex and print immediately; Core will either
+                                    // queue alongside tool outputs or replace the running turn.
+                                    self.submit_user_message(user_message);
+                                }
+                            }
                         } else {
                             self.submit_user_message(user_message);
                         }
@@ -1125,6 +1137,8 @@ impl ChatWidget {
             self.add_to_history(cell);
         }
     }
+
+    // No TUI-level mid-tool-call logic; Core manages it.
 
     // If idle and there are queued inputs, submit exactly one to start the next turn.
     fn maybe_send_next_queued_input(&mut self) {
