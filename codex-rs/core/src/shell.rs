@@ -220,6 +220,7 @@ pub async fn default_user_shell(_session_id: Uuid, _codex_home: &Path) -> Shell 
         .unwrap_or(false);
     let bash_exe = if Command::new("bash.exe")
         .arg("--version")
+        .stdin(std::process::Stdio::null())
         .output()
         .await
         .ok()
