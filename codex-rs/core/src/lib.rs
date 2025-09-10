@@ -45,6 +45,7 @@ mod event_mapping;
 pub use conversation_manager::ConversationManager;
 pub use conversation_manager::InitialHistory;
 pub use conversation_manager::NewConversation;
+mod config_edit_tool;
 // Re-export common auth types for workspace consumers
 pub use auth::AuthManager;
 pub use auth::CodexAuth;
