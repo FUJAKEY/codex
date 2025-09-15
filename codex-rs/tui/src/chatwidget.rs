@@ -148,6 +148,8 @@ pub(crate) struct ChatWidget {
     pending_notification: Option<Notification>,
     // Simple review mode flag; used to adjust layout and banners.
     is_review_mode: bool,
+    // If true, insert a mode change banner after the current turn completes.
+    mode_change_banner_pending: bool,
 }
 
 struct UserMessage {
@@ -333,6 +335,26 @@ impl ChatWidget {
         }
 
         self.request_redraw();
+
+        // Insert a post‑turn banner if the approval/sandbox mode changed during this turn.
+        if self.mode_change_banner_pending {
+            let approval = self.config.approval_policy.to_string();
+            // Summarize sandbox in a compact, user‑visible form
+            use codex_core::protocol::SandboxPolicy::*;
+            let sandbox_label = match &self.config.sandbox_policy {
+                ReadOnly => "read-only".to_string(),
+                DangerFullAccess => "danger-full-access".to_string(),
+                WorkspaceWrite { .. } => "workspace-write".to_string(),
+            };
+            let msg = format!(
+                "Approval mode was updated during this turn. Current: approval={approval}, sandbox={sandbox_label}."
+            );
+            self.add_to_history(history_cell::new_info_event(
+                msg,
+                Some("Use /status to view current settings".to_string()),
+            ));
+            self.mode_change_banner_pending = false;
+        }
     }
 
     fn on_plan_update(&mut self, update: codex_core::plan_tool::UpdatePlanArgs) {
@@ -714,6 +736,7 @@ impl ChatWidget {
             suppress_session_configured_redraw: false,
             pending_notification: None,
             is_review_mode: false,
+            mode_change_banner_pending: false,
         }
     }
 
@@ -773,6 +796,7 @@ impl ChatWidget {
             suppress_session_configured_redraw: true,
             pending_notification: None,
             is_review_mode: false,
+            mode_change_banner_pending: false,
         }
     }
 
@@ -1404,11 +1428,15 @@ impl ChatWidget {
     /// Set the approval policy in the widget's config copy.
     pub(crate) fn set_approval_policy(&mut self, policy: AskForApproval) {
         self.config.approval_policy = policy;
+        // Mark to show a post‑turn banner reflecting the new mode.
+        self.mode_change_banner_pending = true;
     }
 
     /// Set the sandbox policy in the widget's config copy.
     pub(crate) fn set_sandbox_policy(&mut self, policy: SandboxPolicy) {
         self.config.sandbox_policy = policy;
+        // Mark to show a post‑turn banner reflecting the new mode.
+        self.mode_change_banner_pending = true;
     }
 
     /// Set the reasoning effort in the widget's config copy.

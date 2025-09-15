@@ -149,7 +149,17 @@ impl BottomPaneView for ApprovalModalView {
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
         match &self.mode {
-            Mode::Prompt => (&self.current).render_ref(area, buf),
+            Mode::Prompt => {
+                (&self.current).render_ref(area, buf);
+                // Visible hint when feature is enabled: keep wording consistent with other hints.
+                if self.midturn_approval_mode_enabled {
+                    let footer_y = area.y.saturating_add(area.height.saturating_sub(1));
+                    if footer_y >= area.y {
+                        let footer = Rect::new(area.x.saturating_add(2), footer_y, area.width.saturating_sub(4), 1);
+                        Line::from("Press 'c' to change approval mode").italic().dim().render(footer, buf);
+                    }
+                }
+            }
             Mode::SelectingPresets { presets, selected } => {
                 // Draw a simple inline selector box inside the existing modal area.
                 let [title, list, footer] = Layout::vertical([

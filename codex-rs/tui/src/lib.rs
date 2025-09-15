@@ -184,6 +184,14 @@ pub async fn run_main(
         }
     };
 
+    // Read mid‑turn approval mode flag from config.toml ([tui]).
+    // Read mid‑turn approval mode flag from config.toml ([tui]).
+    let midturn_enabled_for_call = config_toml
+        .tui
+        .as_ref()
+        .and_then(|t| t.midturn_approval_mode_enabled)
+        .unwrap_or(false);
+
     let cli_profile_override = cli.config_profile.clone();
     let active_profile = cli_profile_override
         .clone()
@@ -247,6 +255,7 @@ pub async fn run_main(
         internal_storage,
         active_profile,
         should_show_trust_screen,
+        midturn_enabled_for_call,
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))
@@ -258,6 +267,7 @@ async fn run_ratatui_app(
     mut internal_storage: InternalStorage,
     active_profile: Option<String>,
     should_show_trust_screen: bool,
+    midturn_enabled_for_call: bool,
 ) -> color_eyre::Result<AppExitInfo> {
     let mut config = config;
     color_eyre::install()?;
@@ -413,30 +423,6 @@ async fn run_ratatui_app(
 
     let Cli { prompt, images, .. } = cli;
 
-    // Determine mid‑turn approval change gating from config.toml: [tui].midturn_approval_mode_enabled
-    let midturn_approval_mode_enabled = {
-        let codex_home = match find_codex_home() {
-            Ok(codex_home) => codex_home,
-            Err(_) => config.codex_home.clone(),
-        };
-        let overrides_for_read = {
-            let raw_overrides = cli.config_overrides.raw_overrides.clone();
-            let overrides_cli = codex_common::CliConfigOverrides { raw_overrides };
-            match overrides_cli.parse_overrides() {
-                Ok(v) => v,
-                Err(_) => Default::default(),
-            }
-        };
-        match load_config_as_toml_with_cli_overrides(&codex_home, overrides_for_read) {
-            Ok(toml) => toml
-                .tui
-                .as_ref()
-                .and_then(|t| t.midturn_approval_mode_enabled)
-                .unwrap_or(false),
-            Err(_) => false,
-        }
-    };
-
     let app_result = App::run(
         &mut tui,
         auth_manager,
@@ -445,7 +431,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         resume_selection,
-        midturn_approval_mode_enabled,
+        midturn_enabled_for_call,
     )
     .await;
 

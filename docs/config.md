@@ -611,6 +611,12 @@ midturn_approval_mode_enabled = true
 > [!NOTE]
 > `tui.notifications` is built‑in and limited to the TUI session. For programmatic or cross‑environment notifications—or to integrate with OS‑specific notifiers—use the top‑level `notify` option to run an external program that receives event JSON. The two settings are independent and can be used together.
 
+Per-run CLI override:
+
+```
+codex -c tui.midturn_approval_mode_enabled=true
+```
+
 ## Config reference
 
 | Key | Type / Values | Notes |
