@@ -72,6 +72,9 @@ pub struct Cli {
     #[arg(long = "search", default_value_t = false)]
     pub web_search: bool,
 
+    // Intentionally no CLI flag for mid‑turn approval mode changes.
+    // Users can enable this via config.toml under [tui].
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }

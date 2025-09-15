@@ -413,6 +413,30 @@ async fn run_ratatui_app(
 
     let Cli { prompt, images, .. } = cli;
 
+    // Determine mid‑turn approval change gating from config.toml: [tui].midturn_approval_mode_enabled
+    let midturn_approval_mode_enabled = {
+        let codex_home = match find_codex_home() {
+            Ok(codex_home) => codex_home,
+            Err(_) => config.codex_home.clone(),
+        };
+        let overrides_for_read = {
+            let raw_overrides = cli.config_overrides.raw_overrides.clone();
+            let overrides_cli = codex_common::CliConfigOverrides { raw_overrides };
+            match overrides_cli.parse_overrides() {
+                Ok(v) => v,
+                Err(_) => Default::default(),
+            }
+        };
+        match load_config_as_toml_with_cli_overrides(&codex_home, overrides_for_read) {
+            Ok(toml) => toml
+                .tui
+                .as_ref()
+                .and_then(|t| t.midturn_approval_mode_enabled)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    };
+
     let app_result = App::run(
         &mut tui,
         auth_manager,
@@ -421,6 +445,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         resume_selection,
+        midturn_approval_mode_enabled,
     )
     .await;
 

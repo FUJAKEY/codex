@@ -591,6 +591,18 @@ notifications = true
 # You can optionally filter to specific notification types.
 # Available types are "agent-turn-complete" and "approval-requested".
 notifications = [ "agent-turn-complete", "approval-requested" ]
+
+# Enable 'c' hotkey to change approval/sandbox mode from within approval prompts.
+# When enabled, press 'c' while an approval prompt is visible to open the presets selector
+# (Read Only / Auto / Full Access). Selecting a preset applies both approval policy and
+# sandbox mode, in harmony with /approvals. Changes take effect after the current prompt if
+# one is in progress.
+midturn_approval_mode_enabled = false
+
+# You can also set this per-profile:
+
+[profiles.gpt5.tui]
+midturn_approval_mode_enabled = true
 ```
 
 > [!NOTE]
@@ -637,7 +649,8 @@ notifications = [ "agent-turn-complete", "approval-requested" ]
 | `history.max_bytes` | number | Currently ignored (not enforced). |
 | `file_opener` | `vscode` \| `vscode-insiders` \| `windsurf` \| `cursor` \| `none` | URI scheme for clickable citations (default: `vscode`). |
 | `tui` | table | TUI‑specific options. |
-| `tui.notifications` | boolean \| array<string> | Enable desktop notifications in the tui (default: false). |
+| `tui.notifications` | boolean \| array<string> | Enable desktop notifications in the TUI (default: false). |
+| `tui.midturn_approval_mode_enabled` | boolean | Enable 'c' hotkey to change approval/sandbox mode inside approval prompts (default: false). |
 | `hide_agent_reasoning` | boolean | Hide model reasoning events. |
 | `show_raw_agent_reasoning` | boolean | Show raw reasoning (when available). |
 | `model_reasoning_effort` | `minimal` \| `low` \| `medium` \| `high` | Responses API reasoning effort. |
