@@ -46,12 +46,10 @@ pub(crate) async fn apply_patch(
     call_id: &str,
     action: ApplyPatchAction,
 ) -> InternalApplyPatchInvocation {
-    match assess_patch_safety(
-        &action,
-        turn_context.approval_policy,
-        &turn_context.sandbox_policy,
-        &turn_context.cwd,
-    ) {
+    let (effective_approval, effective_sandbox) = sess
+        .effective_policies(turn_context.approval_policy, &turn_context.sandbox_policy)
+        .await;
+    match assess_patch_safety(&action, effective_approval, &effective_sandbox, &turn_context.cwd) {
         SafetyCheck::AutoApprove { .. } => {
             InternalApplyPatchInvocation::DelegateToExec(ApplyPatchExec {
                 action,

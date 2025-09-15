@@ -257,6 +257,10 @@ struct State {
     pending_input: Vec<ResponseInputItem>,
     history: ConversationHistory,
     token_info: Option<TokenUsageInfo>,
+    // Live overrides for approval/sandbox policy that should take effect
+    // immediately for the current running turn.
+    approval_policy_override: Option<AskForApproval>,
+    sandbox_policy_override: Option<SandboxPolicy>,
 }
 
 /// Context for an initialized model agent
@@ -707,6 +711,25 @@ impl Session {
             .map(RolloutItem::ResponseItem)
             .collect();
         self.persist_rollout_items(&rollout_items).await;
+    }
+
+    /// Compute effective approval + sandbox policies for the current moment
+    /// in a running turn by honoring any live overrides stored in the session
+    /// state. Falls back to the defaults from the current TurnContext.
+    pub(crate) async fn effective_policies(
+        &self,
+        default_approval: AskForApproval,
+        default_sandbox: &SandboxPolicy,
+    ) -> (AskForApproval, SandboxPolicy) {
+        let state = self.state.lock().await;
+        let approval = state
+            .approval_policy_override
+            .unwrap_or(default_approval);
+        let sandbox = state
+            .sandbox_policy_override
+            .clone()
+            .unwrap_or_else(|| default_sandbox.clone());
+        (approval, sandbox)
     }
 
     pub(crate) fn build_initial_context(&self, turn_context: &TurnContext) -> Vec<ResponseItem> {
@@ -1257,6 +1280,20 @@ async fn submission_loop(
 
                 // Install the new persistent context for subsequent tasks/turns.
                 turn_context = Arc::new(new_turn_context);
+
+                // Also record live overrides so mid‑turn approvals use the new
+                // policy immediately for subsequent decisions in this running turn.
+                {
+                    let mut state = sess.state.lock().await;
+                    if cwd.is_some() || approval_policy.is_some() || sandbox_policy.is_some() {
+                        if approval_policy.is_some() {
+                            state.approval_policy_override = Some(new_approval_policy);
+                        }
+                        if sandbox_policy.is_some() {
+                            state.sandbox_policy_override = Some(new_sandbox_policy.clone());
+                        }
+                    }
+                }
 
                 // Optionally persist changes to model / effort
                 if cwd.is_some() || approval_policy.is_some() || sandbox_policy.is_some() {
@@ -2716,21 +2753,25 @@ async fn handle_container_exec_with_params(
     sub_id: String,
     call_id: String,
 ) -> ResponseInputItem {
+    // Compute effective policies, honoring live overrides set mid‑turn.
+    let (effective_approval, effective_sandbox) = sess
+        .effective_policies(turn_context.approval_policy, &turn_context.sandbox_policy)
+        .await;
+
     if params.with_escalated_permissions.unwrap_or(false)
-        && !matches!(turn_context.approval_policy, AskForApproval::OnRequest)
+        && !matches!(effective_approval, AskForApproval::OnRequest)
     {
         return ResponseInputItem::FunctionCallOutput {
             call_id,
             output: FunctionCallOutputPayload {
                 content: format!(
                     "approval policy is {policy:?}; reject command — you should not ask for escalated permissions if the approval policy is {policy:?}",
-                    policy = turn_context.approval_policy
+                    policy = effective_approval
                 ),
                 success: None,
             },
         };
     }
-
     // check if this was a patch, and apply it if so
     let apply_patch_exec = match maybe_parse_apply_patch_verified(&params.command, &params.cwd) {
         MaybeApplyPatchVerified::Body(changes) => {
@@ -2796,8 +2837,8 @@ async fn handle_container_exec_with_params(
                 }
             } else {
                 assess_safety_for_untrusted_command(
-                    turn_context.approval_policy,
-                    &turn_context.sandbox_policy,
+                    effective_approval,
+                    &effective_sandbox,
                     params.with_escalated_permissions.unwrap_or(false),
                 )
             };
@@ -2812,8 +2853,8 @@ async fn handle_container_exec_with_params(
                 let state = sess.state.lock().await;
                 assess_command_safety(
                     &params.command,
-                    turn_context.approval_policy,
-                    &turn_context.sandbox_policy,
+                    effective_approval,
+                    &effective_sandbox,
                     &state.approved_commands,
                     params.with_escalated_permissions.unwrap_or(false),
                 )
@@ -2967,9 +3008,14 @@ async fn handle_sandbox_error(
         };
     }
 
+    // Resolve the effective approval policy (honors live overrides).
+    let (effective_approval, _effective_sandbox) = sess
+        .effective_policies(turn_context.approval_policy, &turn_context.sandbox_policy)
+        .await;
+
     // Early out if either the user never wants to be asked for approval, or
     // we're letting the model manage escalation requests. Otherwise, continue
-    match turn_context.approval_policy {
+    match effective_approval {
         AskForApproval::Never | AskForApproval::OnRequest => {
             return ResponseInputItem::FunctionCallOutput {
                 call_id,

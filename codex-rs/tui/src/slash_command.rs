@@ -62,13 +62,13 @@ impl SlashCommand {
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Model
-            | SlashCommand::Approvals
             | SlashCommand::Review
             | SlashCommand::Logout => false,
             SlashCommand::Diff
             | SlashCommand::Mention
             | SlashCommand::Status
             | SlashCommand::Mcp
+            | SlashCommand::Approvals
             | SlashCommand::Quit => true,
 
             #[cfg(debug_assertions)]

@@ -723,6 +723,24 @@ fn disabled_slash_command_while_task_running_snapshot() {
     assert_snapshot!(blob);
 }
 
+#[test]
+fn approvals_allowed_while_task_running() {
+    // Build a chat widget and simulate an active task
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane.set_task_running(true);
+
+    // Dispatch a command that we want to allow during a task (e.g., /approvals)
+    chat.dispatch_command(SlashCommand::Approvals);
+
+    // Drain history; previously, disallowed commands emit an error cell. For
+    // /approvals, we expect no error history to be emitted upon dispatch.
+    let cells = drain_insert_history(&mut rx);
+    assert!(
+        cells.is_empty(),
+        "expected no error history cell for '/approvals' while a task runs"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn binary_size_transcript_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
