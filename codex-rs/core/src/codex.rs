@@ -463,6 +463,7 @@ impl Session {
                 use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
                 include_view_image_tool: config.include_view_image_tool,
                 experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+                reasoning_effort: model_reasoning_effort,
             }),
             user_instructions,
             base_instructions,
@@ -1243,6 +1244,7 @@ async fn submission_loop(
                     use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
                     include_view_image_tool: config.include_view_image_tool,
                     experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+                    reasoning_effort: effective_effort,
                 });
 
                 let new_turn_context = TurnContext {
@@ -1333,6 +1335,7 @@ async fn submission_loop(
                             include_view_image_tool: config.include_view_image_tool,
                             experimental_unified_exec_tool: config
                                 .use_experimental_unified_exec_tool,
+                            reasoning_effort: effort,
                         }),
                         user_instructions: turn_context.user_instructions.clone(),
                         base_instructions: turn_context.base_instructions.clone(),
@@ -1559,6 +1562,7 @@ async fn spawn_review_thread(
         use_streamable_shell_tool: false,
         include_view_image_tool: false,
         experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+        reasoning_effort: parent_turn_context.client.get_reasoning_effort(),
     });
 
     let base_instructions = REVIEW_PROMPT.to_string();
@@ -3594,6 +3598,7 @@ mod tests {
             use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
             include_view_image_tool: config.include_view_image_tool,
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+            reasoning_effort: config.model_reasoning_effort,
         });
         let turn_context = TurnContext {
             client,
