@@ -73,6 +73,7 @@ use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::model_family::find_family_for_model;
 use crate::openai_model_info::get_model_info;
 use crate::openai_tools::ApplyPatchToolArgs;
+
 use crate::openai_tools::ToolsConfig;
 use crate::openai_tools::ToolsConfigParams;
 use crate::openai_tools::get_openai_tools;
@@ -135,19 +136,42 @@ mod compact;
 use self::compact::build_compacted_history;
 use self::compact::collect_user_messages;
 
-// A convenience extension trait for acquiring mutex locks where poisoning is
-// unrecoverable and should abort the program. This avoids scattered `.unwrap()`
-// calls on `lock()` while still surfacing a clear panic message when a lock is
-// poisoned.
+// A convenience extension trait for acquiring mutex locks with automatic
+// recovery from poison errors. This provides a cleaner API than manually
+// handling poisoned locks at every call site.
 trait MutexExt<T> {
-    fn lock_unchecked(&self) -> MutexGuard<'_, T>;
+    fn lock_or_recover(&self) -> MutexGuard<'_, T>;
 }
 
 impl<T> MutexExt<T> for Mutex<T> {
-    fn lock_unchecked(&self) -> MutexGuard<'_, T> {
-        #[expect(clippy::expect_used)]
-        self.lock().expect("poisoned lock")
+    fn lock_or_recover(&self) -> MutexGuard<'_, T> {
+        match self.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Log the poisoned lock but recover and continue
+                // This is safe because we're taking ownership of the data
+                tracing::warn!("Recovering from poisoned mutex");
+                poisoned.into_inner()
+            }
+        }
     }
+}
+
+/// Structure to hold pending tool calls for parallel execution
+#[derive(Clone)]
+struct PendingToolCall {
+    item: ResponseItem,
+    call_id: String,
+    name: String,
+    arguments: Option<String>,
+}
+
+/// Arguments for the agent tool
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentToolArgs {
+    task: String,
+    agent: Option<String>,
+    context: Option<String>,
 }
 
 /// The high-level interface to the Codex system.
@@ -286,6 +310,9 @@ pub(crate) struct Session {
     mcp_connection_manager: McpConnectionManager,
     session_manager: ExecSessionManager,
     unified_exec_manager: UnifiedExecSessionManager,
+
+    /// Agent registry for multi-agent orchestration
+    agent_registry: Mutex<Option<Arc<crate::agent::AgentRegistry>>>,
 
     /// External notifier command (will be passed as args to exec()). When
     /// `None` this feature is disabled.
@@ -479,6 +506,7 @@ impl Session {
                 use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
                 include_view_image_tool: config.include_view_image_tool,
                 experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+                include_agent_tool: true, // Enable agent tool by default
             }),
             user_instructions,
             base_instructions,
@@ -488,12 +516,23 @@ impl Session {
             cwd,
             is_review_mode: false,
         };
+
+        // Initialize agent registry once during session creation
+        let agent_registry = match crate::agent::AgentRegistry::new() {
+            Ok(r) => Some(Arc::new(r)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize agent registry: {e}");
+                None
+            }
+        };
+
         let sess = Arc::new(Session {
             conversation_id,
             tx_event: tx_event.clone(),
             mcp_connection_manager,
             session_manager: ExecSessionManager::default(),
             unified_exec_manager: UnifiedExecSessionManager::default(),
+            agent_registry: Mutex::new(agent_registry),
             notify,
             state: Mutex::new(state),
             rollout: Mutex::new(Some(rollout_recorder)),
@@ -529,7 +568,7 @@ impl Session {
     }
 
     pub fn set_task(&self, task: AgentTask) {
-        let mut state = self.state.lock_unchecked();
+        let mut state = self.state.lock_or_recover();
         if let Some(current_task) = state.current_task.take() {
             current_task.abort(TurnAbortReason::Replaced);
         }
@@ -537,7 +576,7 @@ impl Session {
     }
 
     pub fn remove_task(&self, sub_id: &str) {
-        let mut state = self.state.lock_unchecked();
+        let mut state = self.state.lock_or_recover();
         if let Some(task) = &state.current_task
             && task.sub_id == sub_id
         {
@@ -546,7 +585,7 @@ impl Session {
     }
 
     fn next_internal_sub_id(&self) -> String {
-        let mut state = self.state.lock_unchecked();
+        let mut state = self.state.lock_or_recover();
         let id = state.next_internal_sub_id;
         state.next_internal_sub_id += 1;
         format!("auto-compact-{id}")
@@ -604,7 +643,7 @@ impl Session {
         let (tx_approve, rx_approve) = oneshot::channel();
         let event_id = sub_id.clone();
         let prev_entry = {
-            let mut state = self.state.lock_unchecked();
+            let mut state = self.state.lock_or_recover();
             state.pending_approvals.insert(sub_id, tx_approve)
         };
         if prev_entry.is_some() {
@@ -636,7 +675,7 @@ impl Session {
         let (tx_approve, rx_approve) = oneshot::channel();
         let event_id = sub_id.clone();
         let prev_entry = {
-            let mut state = self.state.lock_unchecked();
+            let mut state = self.state.lock_or_recover();
             state.pending_approvals.insert(sub_id, tx_approve)
         };
         if prev_entry.is_some() {
@@ -658,7 +697,7 @@ impl Session {
 
     pub fn notify_approval(&self, sub_id: &str, decision: ReviewDecision) {
         let entry = {
-            let mut state = self.state.lock_unchecked();
+            let mut state = self.state.lock_or_recover();
             state.pending_approvals.remove(sub_id)
         };
         match entry {
@@ -672,7 +711,7 @@ impl Session {
     }
 
     pub fn add_approved_command(&self, cmd: Vec<String>) {
-        let mut state = self.state.lock_unchecked();
+        let mut state = self.state.lock_or_recover();
         state.approved_commands.insert(cmd);
     }
 
@@ -713,7 +752,7 @@ impl Session {
     /// Append ResponseItems to the in-memory conversation history only.
     fn record_into_history(&self, items: &[ResponseItem]) {
         self.state
-            .lock_unchecked()
+            .lock_or_recover()
             .history
             .record_items(items.iter());
     }
@@ -743,7 +782,7 @@ impl Session {
 
     async fn persist_rollout_items(&self, items: &[RolloutItem]) {
         let recorder = {
-            let guard = self.rollout.lock_unchecked();
+            let guard = self.rollout.lock_or_recover();
             guard.as_ref().cloned()
         };
         if let Some(rec) = recorder
@@ -758,7 +797,7 @@ impl Session {
         turn_context: &TurnContext,
         token_usage: &Option<TokenUsage>,
     ) -> Option<TokenUsageInfo> {
-        let mut state = self.state.lock_unchecked();
+        let mut state = self.state.lock_or_recover();
         let info = TokenUsageInfo::new_or_append(
             &state.token_info,
             token_usage,
@@ -974,12 +1013,12 @@ impl Session {
     /// Build the full turn input by concatenating the current conversation
     /// history with additional items for this turn.
     pub fn turn_input_with_history(&self, extra: Vec<ResponseItem>) -> Vec<ResponseItem> {
-        [self.state.lock_unchecked().history.contents(), extra].concat()
+        [self.state.lock_or_recover().history.contents(), extra].concat()
     }
 
     /// Returns the input if there was no task running to inject into
     pub fn inject_input(&self, input: Vec<InputItem>) -> Result<(), Vec<InputItem>> {
-        let mut state = self.state.lock_unchecked();
+        let mut state = self.state.lock_or_recover();
         if state.current_task.is_some() {
             state.pending_input.push(input.into());
             Ok(())
@@ -989,7 +1028,7 @@ impl Session {
     }
 
     pub fn get_pending_input(&self) -> Vec<ResponseInputItem> {
-        let mut state = self.state.lock_unchecked();
+        let mut state = self.state.lock_or_recover();
         if state.pending_input.is_empty() {
             Vec::with_capacity(0)
         } else {
@@ -1013,7 +1052,7 @@ impl Session {
 
     fn interrupt_task(&self) {
         info!("interrupt received: abort current task, if any");
-        let mut state = self.state.lock_unchecked();
+        let mut state = self.state.lock_or_recover();
         state.pending_approvals.clear();
         state.pending_input.clear();
         if let Some(task) = state.current_task.take() {
@@ -1246,6 +1285,7 @@ async fn submission_loop(
                     use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
                     include_view_image_tool: config.include_view_image_tool,
                     experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+                    include_agent_tool: true,
                 });
 
                 let new_turn_context = TurnContext {
@@ -1336,6 +1376,7 @@ async fn submission_loop(
                             include_view_image_tool: config.include_view_image_tool,
                             experimental_unified_exec_tool: config
                                 .use_experimental_unified_exec_tool,
+                            include_agent_tool: true,
                         }),
                         user_instructions: turn_context.user_instructions.clone(),
                         base_instructions: turn_context.base_instructions.clone(),
@@ -1432,6 +1473,25 @@ async fn submission_loop(
                 };
                 sess.send_event(event).await;
             }
+            Op::ListAgents => {
+                let sub_id = sub.id.clone();
+
+                // Get the agent registry and list agents
+                let agents = {
+                    let agent_registry_guard = sess.agent_registry.lock_or_recover();
+                    agent_registry_guard
+                        .as_ref()
+                        .map(|r| r.list_agent_details())
+                        .unwrap_or_else(Vec::new)
+                }; // MutexGuard is dropped here
+                let event = Event {
+                    id: sub_id,
+                    msg: EventMsg::ListAgentsResponse(crate::protocol::ListAgentsResponseEvent {
+                        agents,
+                    }),
+                };
+                sess.send_event(event).await;
+            }
             Op::ListCustomPrompts => {
                 let sub_id = sub.id.clone();
 
@@ -1468,7 +1528,7 @@ async fn submission_loop(
 
                 // Gracefully flush and shutdown rollout recorder on session end so tests
                 // that inspect the rollout file do not race with the background writer.
-                let recorder_opt = sess.rollout.lock_unchecked().take();
+                let recorder_opt = sess.rollout.lock_or_recover().take();
                 if let Some(rec) = recorder_opt
                     && let Err(e) = rec.shutdown().await
                 {
@@ -1493,7 +1553,7 @@ async fn submission_loop(
                 let sub_id = sub.id.clone();
                 // Flush rollout writes before returning the path so readers observe a consistent file.
                 let (path, rec_opt) = {
-                    let guard = sess.rollout.lock_unchecked();
+                    let guard = sess.rollout.lock_or_recover();
                     match guard.as_ref() {
                         Some(rec) => (rec.get_rollout_path(), Some(rec.clone())),
                         None => {
@@ -1555,6 +1615,7 @@ async fn spawn_review_thread(
         use_streamable_shell_tool: false,
         include_view_image_tool: false,
         experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+        include_agent_tool: false, // Disable for review mode
     });
 
     let base_instructions = REVIEW_PROMPT.to_string();
@@ -1948,9 +2009,18 @@ async fn run_turn(
     sub_id: String,
     input: Vec<ResponseItem>,
 ) -> CodexResult<TurnRunResult> {
+    // Get agent list if available
+    let agent_infos =
+        if let Ok(Some(registry)) = sess.agent_registry.lock().map(|g| g.as_ref().cloned()) {
+            Some(registry.list_agent_details())
+        } else {
+            None
+        };
+
     let tools = get_openai_tools(
         &turn_context.tools_config,
         Some(sess.mcp_connection_manager.list_all_tools()),
+        agent_infos,
     );
 
     let prompt = Prompt {
@@ -2092,6 +2162,11 @@ async fn try_run_turn(
 
     let mut output = Vec::new();
 
+    // First pass: collect all items from the stream
+    let mut collected_items = Vec::new();
+    #[allow(unused_assignments)]
+    let mut token_usage_result: Option<TokenUsage> = None;
+
     loop {
         // Poll the next item from the model stream. We must inspect *both* Ok and Err
         // cases so that transient stream failures (e.g., dropped SSE connection before
@@ -2118,15 +2193,7 @@ async fn try_run_turn(
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(item) => {
-                let response = handle_response_item(
-                    sess,
-                    turn_context,
-                    turn_diff_tracker,
-                    sub_id,
-                    item.clone(),
-                )
-                .await?;
-                output.push(ProcessedResponseItem { item, response });
+                collected_items.push(item);
             }
             ResponseEvent::WebSearchCallBegin { call_id } => {
                 let _ = sess
@@ -2159,12 +2226,9 @@ async fn try_run_turn(
                     sess.send_event(event).await;
                 }
 
-                let result = TurnRunResult {
-                    processed_items: output,
-                    total_token_usage: token_usage.clone(),
-                };
-
-                return Ok(result);
+                // Store the token usage for the result
+                token_usage_result = token_usage.clone();
+                break; // Exit the collection loop
             }
             ResponseEvent::OutputTextDelta(delta) => {
                 // In review child threads, suppress assistant text deltas; the
@@ -2206,6 +2270,174 @@ async fn try_run_turn(
             }
         }
     }
+
+    // Process collected items after the stream completes
+    // Process items in order while collecting agent calls for parallel execution
+    let mut processed_items = Vec::new();
+    let mut pending_agent_calls = Vec::new();
+
+    for item in collected_items {
+        match &item {
+            ResponseItem::FunctionCall {
+                name,
+                call_id,
+                arguments,
+                ..
+            } if name == "agent" => {
+                // Collect agent calls for parallel execution
+                pending_agent_calls.push(PendingToolCall {
+                    item: item.clone(),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: Some(arguments.clone()),
+                });
+            }
+            ResponseItem::FunctionCall { .. } => {
+                // Process non-agent function calls immediately in order
+                let response = handle_response_item(
+                    sess,
+                    turn_context,
+                    turn_diff_tracker,
+                    sub_id,
+                    item.clone(),
+                )
+                .await?;
+                if let Some(resp) = response.clone() {
+                    output.push(resp);
+                }
+                processed_items.push(ProcessedResponseItem {
+                    item: item.clone(),
+                    response,
+                });
+            }
+            ResponseItem::LocalShellCall {
+                call_id: Some(id), ..
+            } => {
+                // Process shell calls immediately in order
+                let response = handle_response_item(
+                    sess,
+                    turn_context,
+                    turn_diff_tracker,
+                    sub_id,
+                    item.clone(),
+                )
+                .await?;
+                if let Some(resp) = response.clone() {
+                    output.push(resp);
+                }
+                processed_items.push(ProcessedResponseItem {
+                    item: item.clone(),
+                    response,
+                });
+            }
+            ResponseItem::CustomToolCall { name, call_id, .. } if name == "agent" => {
+                // Collect agent calls for parallel execution
+                pending_agent_calls.push(PendingToolCall {
+                    item: item.clone(),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: None,
+                });
+            }
+            ResponseItem::CustomToolCall { .. } => {
+                // Process non-agent custom tool calls immediately in order
+                let response = handle_response_item(
+                    sess,
+                    turn_context,
+                    turn_diff_tracker,
+                    sub_id,
+                    item.clone(),
+                )
+                .await?;
+                if let Some(resp) = response.clone() {
+                    output.push(resp);
+                }
+                processed_items.push(ProcessedResponseItem {
+                    item: item.clone(),
+                    response,
+                });
+            }
+            _ => {
+                // Process non-tool items immediately in order
+                let response = handle_response_item(
+                    sess,
+                    turn_context,
+                    turn_diff_tracker,
+                    sub_id,
+                    item.clone(),
+                )
+                .await?;
+                if let Some(resp) = response.clone() {
+                    output.push(resp);
+                }
+                processed_items.push(ProcessedResponseItem { item, response });
+            }
+        }
+    }
+
+    // Process pending agent calls in parallel if any were collected
+    if !pending_agent_calls.is_empty() {
+        // Handle agent calls with TRUE PARALLEL EXECUTION
+        // All agents run concurrently at the same time, not sequentially
+        // This provides maximum performance for multi-agent orchestration
+
+        // Notify UI about parallel agent execution starting
+        if pending_agent_calls.len() > 1 {
+            let event = Event {
+                id: sub_id.to_string(),
+                msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+                    message: format!(
+                        "🚀 Starting {} agents in PARALLEL...",
+                        pending_agent_calls.len()
+                    ),
+                }),
+            };
+            sess.send_event(event).await;
+        }
+
+        let agent_call_params: Vec<_> = pending_agent_calls
+            .iter()
+            .map(|call| {
+                (
+                    call.call_id.clone(),
+                    call.arguments.clone().unwrap_or_default(),
+                    sub_id.to_string(),
+                )
+            })
+            .collect();
+
+        // Execute all agents in parallel with proper concurrency control
+        let agent_results = {
+            // Create thread-safe wrappers for concurrent execution
+            // SAFETY: sess and turn_context are guaranteed to outlive this call
+            // as they're borrowed from the enclosing function scope
+            let sess_wrapper = Arc::new(SessionWrapper::new(sess));
+            let context_wrapper = Arc::new(TurnContextWrapper::new(turn_context));
+
+            execute_agents_concurrent_safe(
+                sess_wrapper,
+                context_wrapper,
+                turn_diff_tracker,
+                agent_call_params,
+            )
+            .await
+        };
+
+        // Process agent results
+        for (i, (_call_id, result)) in agent_results.into_iter().enumerate() {
+            let item = pending_agent_calls[i].item.clone();
+            output.push(result.clone());
+            processed_items.push(ProcessedResponseItem {
+                item,
+                response: Some(result),
+            });
+        }
+    }
+
+    Ok(TurnRunResult {
+        processed_items,
+        total_token_usage: token_usage_result,
+    })
 }
 
 async fn handle_response_item(
@@ -2567,6 +2799,17 @@ async fn handle_function_call(
                 output: function_call_output,
             }
         }
+        "agent" => {
+            // Agent calls are now handled in parallel at the turn level
+            // Return a placeholder response that will be replaced by parallel execution
+            ResponseInputItem::FunctionCallOutput {
+                call_id,
+                output: FunctionCallOutputPayload {
+                    content: "Agent execution deferred for parallel processing".to_string(),
+                    success: Some(false),
+                },
+            }
+        }
         _ => {
             match sess.mcp_connection_manager.parse_tool_name(&name) {
                 Some((server, tool_name)) => {
@@ -2590,6 +2833,515 @@ async fn handle_function_call(
             }
         }
     }
+}
+
+/// Messages sent from agent execution
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum AgentMessage {
+    Loop(String),                // Description of an execution loop/step
+    Change(PathBuf, FileChange), // File change made by the agent (path, change)
+    Output(String),              // General output from the agent
+    Summary(String),             // Summary of agent's work
+}
+
+// =================================================================================
+// Concurrent Execution Wrappers for Thread Safety
+// =================================================================================
+// These wrappers enable safe sharing of Session and TurnContext across threads
+// during parallel agent execution. They use raw pointers internally but are safe
+// because:
+// 1. The referenced objects are guaranteed to outlive the wrappers (enforced by caller)
+// 2. Session and TurnContext have internal synchronization via Mutex fields
+// 3. The wrappers are only used within a controlled scope where lifetimes are guaranteed
+
+/// Thread-safe wrapper for Session to enable concurrent execution
+struct SessionWrapper {
+    // We use a raw pointer here because:
+    // 1. We need to share &Session across threads but Session isn't Clone
+    // 2. The Session is guaranteed to outlive this wrapper (created in same scope)
+    // 3. Session has internal thread-safety via Mutex fields
+    ptr: *const Session,
+    _phantom: std::marker::PhantomData<Session>,
+}
+
+// SAFETY: Session has internal synchronization via Mutex fields
+// The wrapper ensures the Session outlives all uses
+unsafe impl Send for SessionWrapper {}
+unsafe impl Sync for SessionWrapper {}
+
+impl SessionWrapper {
+    fn new(sess: &Session) -> Self {
+        Self {
+            ptr: sess as *const Session,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn get(&self) -> &Session {
+        // SAFETY: The caller guarantees Session outlives this wrapper
+        // This is enforced by the structure of execute_agents_concurrent_safe
+        unsafe { &*self.ptr }
+    }
+}
+
+/// Thread-safe wrapper for TurnContext to enable concurrent execution
+struct TurnContextWrapper {
+    // We use a raw pointer here for the same reasons as SessionWrapper
+    ptr: *const TurnContext,
+    _phantom: std::marker::PhantomData<TurnContext>,
+}
+
+// SAFETY: TurnContext contains only thread-safe types
+// The wrapper ensures the TurnContext outlives all uses
+unsafe impl Send for TurnContextWrapper {}
+unsafe impl Sync for TurnContextWrapper {}
+
+impl TurnContextWrapper {
+    fn new(ctx: &TurnContext) -> Self {
+        Self {
+            ptr: ctx as *const TurnContext,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn get(&self) -> &TurnContext {
+        // SAFETY: The caller guarantees TurnContext outlives this wrapper
+        // This is enforced by the structure of execute_agents_concurrent_safe
+        unsafe { &*self.ptr }
+    }
+}
+
+// =================================================================================
+// Agent Execution Helper Functions
+// =================================================================================
+
+/// Parse agent arguments from JSON string
+fn parse_agent_args(arguments: &str) -> Result<AgentToolArgs, serde_json::Error> {
+    serde_json::from_str::<AgentToolArgs>(arguments)
+}
+
+/// Build the task message for the agent (sent as user input)
+fn build_agent_task_message(context: Option<&str>, task: &str) -> String {
+    match context {
+        Some(ctx) => format!("Context: {ctx}\n\nTask: {task}"),
+        None => format!("Task: {task}"),
+    }
+}
+
+/// Generate a unique plan ID for agent execution
+fn generate_agent_plan_id(agent_name: &str, call_id: &str) -> String {
+    format!(
+        "agent-{}-{}",
+        agent_name,
+        call_id.get(..8).unwrap_or(call_id)
+    )
+}
+
+/// Create an error response for agent calls
+fn create_tool_error_response(item: &ResponseItem, error_msg: &str) -> Option<ResponseInputItem> {
+    match item {
+        ResponseItem::FunctionCall { call_id, .. } => Some(ResponseInputItem::FunctionCallOutput {
+            call_id: call_id.clone(),
+            output: FunctionCallOutputPayload {
+                content: error_msg.to_string(),
+                success: Some(false),
+            },
+        }),
+        ResponseItem::CustomToolCall { call_id, .. } => {
+            Some(ResponseInputItem::CustomToolCallOutput {
+                call_id: call_id.clone(),
+                output: error_msg.to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn create_agent_error_response(call_id: String, error_msg: &str) -> (String, ResponseInputItem) {
+    (
+        call_id.clone(),
+        ResponseInputItem::FunctionCallOutput {
+            call_id,
+            output: FunctionCallOutputPayload {
+                content: error_msg.to_string(),
+                success: Some(false),
+            },
+        },
+    )
+}
+
+/// Get the agent registry from the session
+fn get_agent_registry(sess: &Session) -> Result<Arc<crate::agent::AgentRegistry>, String> {
+    let agent_registry_guard = sess.agent_registry.lock_or_recover();
+    match agent_registry_guard.as_ref() {
+        Some(r) => Ok(r.clone()),
+        None => Err("Agent registry not available".to_string()),
+    }
+}
+/// Execute multiple agents with true parallel execution
+/// Uses safe wrappers to enable concurrent access to Session and TurnContext
+/// All agents run in parallel using futures::future::join_all
+async fn execute_agents_concurrent_safe(
+    sess_wrapper: Arc<SessionWrapper>,
+    context_wrapper: Arc<TurnContextWrapper>,
+    turn_diff_tracker: &mut TurnDiffTracker,
+    agent_calls: Vec<(String, String, String)>, // (call_id, arguments, sub_id)
+) -> Vec<(String, ResponseInputItem)> {
+    use futures::future::join_all;
+
+    let sess = sess_wrapper.get();
+
+    // Get the agent registry once using helper
+    let registry = match get_agent_registry(sess) {
+        Ok(r) => r,
+        Err(msg) => {
+            return agent_calls
+                .into_iter()
+                .map(|(call_id, _, _)| create_agent_error_response(call_id, &msg))
+                .collect();
+        }
+    };
+
+    // Set agent context flag to prevent recursion
+    // Create futures for TRUE PARALLEL agent execution
+    // Each agent runs independently and concurrently
+    let agent_futures: Vec<_> = agent_calls
+        .into_iter()
+        .map(|(call_id, arguments, sub_id)| {
+            let registry_clone = Arc::clone(&registry);
+            let sess_wrapper_clone = Arc::clone(&sess_wrapper);
+            let context_wrapper_clone = Arc::clone(&context_wrapper);
+
+            // Each agent executes in parallel
+            async move {
+                // Parse agent arguments
+                let args = match parse_agent_args(&arguments) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let (call_id, response) = create_agent_error_response(
+                            call_id.clone(),
+                            &format!("Failed to parse agent arguments: {e}"),
+                        );
+                        return (call_id, response, TurnDiffTracker::new());
+                    }
+                };
+
+                let agent_name = args.agent.unwrap_or_else(|| "general".to_string());
+                let agent_system_prompt = registry_clone.get_system_prompt(&agent_name);
+
+                // Build the agent's task message (what the user is asking)
+                let agent_task_message =
+                    build_agent_task_message(args.context.as_deref(), &args.task);
+
+                let plan_item_id = generate_agent_plan_id(&agent_name, &call_id);
+
+                // Execute the agent with concurrent support
+                let (result, diff_tracker) = execute_agent_isolated_concurrent(
+                    sess_wrapper_clone,
+                    context_wrapper_clone,
+                    AgentExecutionParams {
+                        sub_id: sub_id.clone(),
+                        agent_name: agent_name.clone(),
+                        task_message: agent_task_message,
+                        agent_system_prompt: agent_system_prompt.clone(),
+                        call_id: call_id.clone(),
+                        _plan_item_id: Some(plan_item_id),
+                    },
+                )
+                .await;
+
+                // Convert result to ResponseInputItem
+                let response = match result {
+                    Ok(agent_response) => ResponseInputItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: FunctionCallOutputPayload {
+                            content: agent_response,
+                            success: Some(true),
+                        },
+                    },
+                    Err(e) => ResponseInputItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: FunctionCallOutputPayload {
+                            content: format!("Agent execution failed: {e}"),
+                            success: Some(false),
+                        },
+                    },
+                };
+
+                (call_id, response, diff_tracker)
+            }
+        })
+        .collect();
+
+    // Execute all agents concurrently - TRUE PARALLELISM
+    // All agents run at the same time, not sequentially
+    let agent_results = join_all(agent_futures).await;
+
+    // Merge all diff trackers from agents and return results
+    let mut results = Vec::new();
+    for (call_id, response, agent_diff_tracker) in agent_results {
+        // Merge the agent's diff tracker into the main one
+        turn_diff_tracker.merge(agent_diff_tracker);
+        results.push((call_id, response));
+    }
+
+    results
+}
+struct AgentExecutionParams {
+    sub_id: String,
+    agent_name: String,
+    task_message: String,
+    agent_system_prompt: String,
+    call_id: String,
+    _plan_item_id: Option<String>,
+}
+
+/// Execute an agent in an isolated context with concurrent support
+async fn execute_agent_isolated_concurrent(
+    sess_wrapper: Arc<SessionWrapper>,
+    context_wrapper: Arc<TurnContextWrapper>,
+    params: AgentExecutionParams,
+) -> (Result<String, String>, TurnDiffTracker) {
+    let sess = sess_wrapper.get();
+    let parent_context = context_wrapper.get();
+    use std::time::Instant;
+    let start_time = Instant::now();
+
+    info!(
+        "Executing agent '{}' with isolated context (parallel)",
+        params.agent_name
+    );
+    // Log agent start and notify UI
+    info!(
+        "Agent '{}' starting task (call_id: {}) - PARALLEL EXECUTION",
+        params.agent_name, params.call_id
+    );
+
+    // Send agent start event to UI for status display
+    sess.send_event(Event {
+        id: params.sub_id.clone(),
+        msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+            message: format!(
+                "🤖 Agent '{}' started: {}",
+                params.agent_name, params.task_message
+            ),
+        }),
+    })
+    .await;
+
+    // Create agent messages - just the task as a user message
+    let agent_messages = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: params.task_message.clone(),
+        }],
+    }];
+
+    // Build agent's custom instructions: agent system prompt + AGENTS.md
+    let mut agent_custom_instructions = String::new();
+
+    // First append the agent's system prompt
+    if !params.agent_system_prompt.is_empty() {
+        agent_custom_instructions.push_str(&params.agent_system_prompt);
+    }
+
+    // Then append AGENTS.md if present
+    if let Some(user_inst) = parent_context.user_instructions.as_deref()
+        && !user_inst.is_empty()
+    {
+        if !agent_custom_instructions.is_empty() {
+            agent_custom_instructions.push_str("\n\n");
+        }
+        agent_custom_instructions.push_str(user_inst);
+    }
+
+    // Create a modified turn context for the agent
+    // base_instructions: Keep parent's base instructions (default Codex instructions)
+    // user_instructions: Agent system prompt + AGENTS.md
+    // IMPORTANT: Disable agent tool for agents to prevent recursion
+    let mut agent_tools_config = parent_context.tools_config.clone();
+    agent_tools_config.include_agent_tool = false; // Prevent agents from spawning other agents
+
+    let agent_turn_context = TurnContext {
+        client: parent_context.client.clone(),
+        tools_config: agent_tools_config,
+        base_instructions: parent_context.base_instructions.clone(), // Keep default base instructions
+        user_instructions: if agent_custom_instructions.is_empty() {
+            None
+        } else {
+            Some(agent_custom_instructions)
+        }, // Agent prompt + AGENTS.md
+        approval_policy: parent_context.approval_policy,
+        sandbox_policy: parent_context.sandbox_policy.clone(),
+        shell_environment_policy: parent_context.shell_environment_policy.clone(),
+        cwd: parent_context.cwd.clone(),
+        is_review_mode: false,
+    };
+
+    // Execute a single turn for the agent
+    let mut agent_response = String::new();
+    let mut turn_diff_tracker = TurnDiffTracker::new();
+
+    match run_turn(
+        sess,
+        &agent_turn_context,
+        &mut turn_diff_tracker,
+        params.sub_id.clone(),
+        agent_messages,
+    )
+    .await
+    {
+        Ok(turn_output) => {
+            // Extract the assistant's response
+            for processed_item in turn_output.processed_items {
+                if let ProcessedResponseItem {
+                    item: ResponseItem::Message { role, content, .. },
+                    response: None,
+                } = processed_item
+                    && role == "assistant"
+                {
+                    for content_item in content {
+                        if let ContentItem::OutputText { text } = content_item {
+                            agent_response.push_str(&text);
+                            agent_response.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            error!("Agent '{}' turn failed: {e:#}", params.agent_name);
+            agent_response = format!("Error during agent execution: {e}");
+            return (Err(agent_response.clone()), turn_diff_tracker);
+        }
+    }
+
+    let duration = start_time.elapsed();
+
+    // Log agent completion for PARALLEL EXECUTION
+    info!(
+        "Agent '{}' completed in {}ms (call_id: {}) - PARALLEL EXECUTION",
+        params.agent_name,
+        duration.as_millis(),
+        params.call_id
+    );
+
+    // Send agent completion status to UI
+    let status_msg = if agent_response.is_empty() {
+        format!(
+            "❌ Agent '{}' failed: No response generated",
+            params.agent_name
+        )
+    } else {
+        let preview = if agent_response.len() > 100 {
+            format!("{}...", &agent_response[..100])
+        } else {
+            agent_response.clone()
+        };
+        format!(
+            "✅ Agent '{}' completed in {:.2}s: {}",
+            params.agent_name,
+            duration.as_secs_f64(),
+            preview.trim().replace('\n', " ")
+        )
+    };
+
+    sess.send_event(Event {
+        id: params.sub_id.clone(),
+        msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+            message: status_msg,
+        }),
+    })
+    .await;
+
+    (Ok(agent_response), turn_diff_tracker)
+}
+
+/// Generate a comprehensive summary of agent execution
+#[allow(dead_code)]
+fn generate_agent_summary(
+    agent_name: &str,
+    init_prompt: &str,
+    loops: &[String],
+    changes: &[(PathBuf, FileChange)],
+    outputs: &[String],
+) -> String {
+    let mut summary = Vec::new();
+
+    // Header
+    summary.push(format!("=== Agent '{agent_name}' Execution Summary ==="));
+    summary.push(String::new());
+
+    // Task description
+    summary.push("**Task:**".to_string());
+    let task_lines: Vec<&str> = init_prompt.lines().collect();
+    if task_lines.len() <= 3 {
+        summary.push(init_prompt.to_string());
+    } else {
+        // Compact long prompts
+        summary.push(format!("{}...", task_lines[..2].join("\n")));
+    }
+    summary.push(String::new());
+
+    // Execution loops
+    if !loops.is_empty() {
+        summary.push("**Execution Steps:**".to_string());
+        for (i, loop_desc) in loops.iter().enumerate() {
+            summary.push(format!("  {}. {}", i + 1, loop_desc));
+        }
+        summary.push(String::new());
+    }
+
+    // File changes
+    if !changes.is_empty() {
+        summary.push(format!("**Changes Made ({} files):**", changes.len()));
+        for (path, change) in changes {
+            let action = match change {
+                FileChange::Add { .. } => "added",
+                FileChange::Delete { .. } => "deleted",
+                FileChange::Update { move_path, .. } => {
+                    if move_path.is_some() {
+                        "moved"
+                    } else {
+                        "modified"
+                    }
+                }
+            };
+            summary.push(format!("  - {} {}", action, path.display()));
+        }
+        summary.push(String::new());
+    } else {
+        summary.push("**Changes Made:** None".to_string());
+        summary.push(String::new());
+    }
+
+    // Compact output
+    if !outputs.is_empty() {
+        summary.push("**Result:**".to_string());
+        let combined_output = outputs.join("\n");
+        let output_lines: Vec<&str> = combined_output.lines().collect();
+
+        // Auto-compact long outputs
+        if output_lines.len() > 10 {
+            // Take first 5 and last 3 lines
+            let compacted = [
+                output_lines[..5].join("\n"),
+                format!("... ({} lines omitted) ...", output_lines.len() - 8),
+                output_lines[output_lines.len() - 3..].join("\n"),
+            ];
+            summary.push(compacted.join("\n"));
+        } else {
+            summary.push(combined_output);
+        }
+        summary.push(String::new());
+    }
+
+    // Footer
+    summary.push(format!("=== Agent '{agent_name}' Complete ==="));
+
+    summary.join("\n")
 }
 
 async fn handle_custom_tool_call(
@@ -2789,7 +3541,7 @@ async fn handle_container_exec_with_params(
         }
         None => {
             let safety = {
-                let state = sess.state.lock_unchecked();
+                let state = sess.state.lock_or_recover();
                 assess_command_safety(
                     &params.command,
                     turn_context.approval_policy,
@@ -3356,7 +4108,7 @@ mod tests {
             }),
         ));
 
-        let actual = session.state.lock_unchecked().history.contents();
+        let actual = session.state.lock_or_recover().history.contents();
         assert_eq!(expected, actual);
     }
 
@@ -3369,7 +4121,7 @@ mod tests {
             session.record_initial_history(&turn_context, InitialHistory::Forked(rollout_items)),
         );
 
-        let actual = session.state.lock_unchecked().history.contents();
+        let actual = session.state.lock_or_recover().history.contents();
         assert_eq!(expected, actual);
     }
 
@@ -3584,6 +4336,7 @@ mod tests {
             use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
             include_view_image_tool: config.include_view_image_tool,
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+            include_agent_tool: true,
         });
         let turn_context = TurnContext {
             client,
@@ -3602,6 +4355,7 @@ mod tests {
             mcp_connection_manager: McpConnectionManager::default(),
             session_manager: ExecSessionManager::default(),
             unified_exec_manager: UnifiedExecSessionManager::default(),
+            agent_registry: Mutex::new(None),
             notify: None,
             rollout: Mutex::new(None),
             state: Mutex::new(State {
