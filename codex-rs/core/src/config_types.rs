@@ -153,6 +153,9 @@ pub struct ShellEnvironmentPolicyToml {
     pub include_only: Option<Vec<String>>,
 
     pub experimental_use_profile: Option<bool>,
+
+    /// Timeout for individual command execution in seconds.
+    pub exec_timeout_seconds: Option<u64>,
 }
 
 pub type EnvironmentVariablePattern = WildMatchPattern<'*', '?'>;
@@ -184,6 +187,9 @@ pub struct ShellEnvironmentPolicy {
 
     /// If true, the shell profile will be used to run the command.
     pub use_profile: bool,
+
+    /// Timeout for individual command execution in seconds. Defaults to 10 seconds.
+    pub exec_timeout_seconds: Option<u64>,
 }
 
 impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
@@ -213,6 +219,7 @@ impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
             r#set,
             include_only,
             use_profile,
+            exec_timeout_seconds: toml.exec_timeout_seconds,
         }
     }
 }
@@ -223,4 +230,20 @@ pub enum ReasoningSummaryFormat {
     #[default]
     None,
     Experimental,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shell_environment_policy_timeout_conversion() {
+        let toml_policy = ShellEnvironmentPolicyToml {
+            exec_timeout_seconds: Some(120),
+            ..Default::default()
+        };
+
+        let policy: ShellEnvironmentPolicy = toml_policy.into();
+        assert_eq!(policy.exec_timeout_seconds, Some(120));
+    }
 }

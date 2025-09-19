@@ -845,6 +845,7 @@ pub struct ConfigOverrides {
     pub include_view_image_tool: Option<bool>,
     pub show_raw_agent_reasoning: Option<bool>,
     pub tools_web_search_request: Option<bool>,
+    pub timeout_seconds: Option<u64>,
 }
 
 impl Config {
@@ -873,6 +874,7 @@ impl Config {
             include_view_image_tool,
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
+            timeout_seconds,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -915,7 +917,16 @@ impl Config {
             })?
             .clone();
 
-        let shell_environment_policy = cfg.shell_environment_policy.into();
+        let shell_environment_policy = {
+            let mut policy_toml = cfg.shell_environment_policy;
+
+            // Override timeout from CLI if provided
+            if let Some(timeout) = timeout_seconds {
+                policy_toml.exec_timeout_seconds = Some(timeout);
+            }
+
+            policy_toml.into()
+        };
 
         let resolved_cwd = {
             use std::env;
@@ -1927,8 +1938,10 @@ trust_level = "trusted"
 
 #[cfg(test)]
 mod notifications_tests {
-    use crate::config_types::Notifications;
+    use super::{Config, ConfigOverrides, ConfigToml};
+    use crate::config_types::{Notifications, ShellEnvironmentPolicyToml};
     use serde::Deserialize;
+    use std::path::PathBuf;
 
     #[derive(Deserialize, Debug, PartialEq)]
     struct TuiTomlTest {
@@ -1965,5 +1978,46 @@ mod notifications_tests {
             parsed.tui.notifications,
             Notifications::Custom(ref v) if v == &vec!["foo".to_string()]
         ));
+    }
+
+    #[test]
+    fn test_timeout_cli_override_applied_to_shell_policy() {
+        let cfg = ConfigToml::default();
+        let overrides = ConfigOverrides {
+            timeout_seconds: Some(120),
+            ..Default::default()
+        };
+
+        let config =
+            Config::load_from_base_config_with_overrides(cfg, overrides, PathBuf::from("/tmp"))
+                .unwrap();
+        assert_eq!(
+            config.shell_environment_policy.exec_timeout_seconds,
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn test_timeout_cli_override_precedence() {
+        let cfg = ConfigToml {
+            shell_environment_policy: ShellEnvironmentPolicyToml {
+                exec_timeout_seconds: Some(60),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let overrides = ConfigOverrides {
+            timeout_seconds: Some(180),
+            ..Default::default()
+        };
+
+        let config =
+            Config::load_from_base_config_with_overrides(cfg, overrides, PathBuf::from("/tmp"))
+                .unwrap();
+        assert_eq!(
+            config.shell_environment_policy.exec_timeout_seconds,
+            Some(180)
+        );
     }
 }

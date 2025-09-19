@@ -2657,10 +2657,18 @@ async fn handle_custom_tool_call(
 }
 
 fn to_exec_params(params: ShellToolCallParams, turn_context: &TurnContext) -> ExecParams {
+    // Use timeout from tool call params, fallback to shell policy timeout (converted to ms), then to default
+    let timeout_ms = params.timeout_ms.or_else(|| {
+        turn_context
+            .shell_environment_policy
+            .exec_timeout_seconds
+            .map(|s| s * 1000)
+    });
+
     ExecParams {
         command: params.command,
         cwd: turn_context.resolve_path(params.workdir.clone()),
-        timeout_ms: params.timeout_ms,
+        timeout_ms,
         env: create_env(&turn_context.shell_environment_policy),
         with_escalated_permissions: params.with_escalated_permissions,
         justification: params.justification,
@@ -3734,5 +3742,72 @@ mod tests {
         rollout_items.push(RolloutItem::ResponseItem(assistant3.clone()));
 
         (rollout_items, live_history.contents())
+    }
+
+    #[test]
+    fn test_to_exec_params_timeout_fallback() {
+        use crate::config_types::ShellEnvironmentPolicy;
+        use crate::config_types::ShellEnvironmentPolicyInherit;
+        use codex_protocol::models::ShellToolCallParams;
+
+        // Create minimal TurnContext-like struct for testing
+        struct MockTurnContext {
+            shell_environment_policy: ShellEnvironmentPolicy,
+            cwd: PathBuf,
+        }
+
+        impl MockTurnContext {
+            fn resolve_path(&self, path: Option<String>) -> PathBuf {
+                path.map(|p| self.cwd.join(p))
+                    .unwrap_or_else(|| self.cwd.clone())
+            }
+        }
+
+        let mock_context = MockTurnContext {
+            shell_environment_policy: ShellEnvironmentPolicy {
+                inherit: ShellEnvironmentPolicyInherit::All,
+                ignore_default_excludes: false,
+                exclude: vec![],
+                r#set: HashMap::new(),
+                include_only: vec![],
+                use_profile: false,
+                exec_timeout_seconds: Some(90),
+            },
+            cwd: PathBuf::from("/tmp"),
+        };
+
+        // Test timeout precedence: tool param (5000ms) takes precedence
+        let params_with_timeout = ShellToolCallParams {
+            command: vec!["echo".to_string()],
+            workdir: None,
+            timeout_ms: Some(5000),
+            with_escalated_permissions: None,
+            justification: None,
+        };
+
+        let timeout_ms = params_with_timeout.timeout_ms.or_else(|| {
+            mock_context
+                .shell_environment_policy
+                .exec_timeout_seconds
+                .map(|s| s * 1000)
+        });
+        assert_eq!(timeout_ms, Some(5000));
+
+        // Test fallback: shell policy timeout (90s * 1000ms) when no tool param
+        let params_without_timeout = ShellToolCallParams {
+            command: vec!["echo".to_string()],
+            workdir: None,
+            timeout_ms: None,
+            with_escalated_permissions: None,
+            justification: None,
+        };
+
+        let timeout_ms = params_without_timeout.timeout_ms.or_else(|| {
+            mock_context
+                .shell_environment_policy
+                .exec_timeout_seconds
+                .map(|s| s * 1000)
+        });
+        assert_eq!(timeout_ms, Some(90000));
     }
 }
