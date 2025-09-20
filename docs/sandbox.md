@@ -82,4 +82,15 @@ The mechanism Codex uses to implement the sandbox policy depends on your OS:
 - **macOS 12+** uses **Apple Seatbelt** and runs commands using `sandbox-exec` with a profile (`-p`) that corresponds to the `--sandbox` that was specified.
 - **Linux** uses a combination of Landlock/seccomp APIs to enforce the `sandbox` configuration.
 
-Note that when running Linux in a containerized environment such as Docker, sandboxing may not work if the host/container configuration does not support the necessary Landlock/seccomp APIs. In such cases, we recommend configuring your Docker container so that it provides the sandbox guarantees you are looking for and then running `codex` with `--sandbox danger-full-access` (or, more simply, the `--dangerously-bypass-approvals-and-sandbox` flag) within your container. 
+Note that when running Linux in a containerized environment such as Docker, sandboxing may not work if the host/container configuration does not support the necessary Landlock/seccomp APIs. In such cases, we recommend configuring your Docker container so that it provides the sandbox guarantees you are looking for and then running `codex` with `--sandbox danger-full-access` (or, more simply, the `--dangerously-bypass-approvals-and-sandbox` flag) within your container.
+
+### Mid‑turn changes (optional)
+
+By default, changing approval/sandbox presets requires the current prompt to finish. If you want to change presets directly from the approval prompt, you can enable an optional TUI setting in `~/.codex/config.toml`:
+
+```toml
+[tui]
+midturn_approval_mode_enabled = true
+```
+
+With this enabled, press `c` while an approval prompt is visible to open the presets selector. Selecting a preset applies both approval policy and sandbox mode (same as `/approvals`). The change takes effect after the current prompt if one is in progress. The transcript includes a notice when the mode is changed.

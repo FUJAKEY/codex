@@ -96,6 +96,11 @@ pub struct Tui {
     /// Defaults to `false`.
     #[serde(default)]
     pub notifications: Notifications,
+    /// Enable 'c' hotkey to change approval/sandbox mode inside approval prompts.
+    /// When true, users can change presets mid‑turn; changes take effect after
+    /// the current prompt if one is in progress.
+    #[serde(default)]
+    pub midturn_approval_mode_enabled: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]

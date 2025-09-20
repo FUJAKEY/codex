@@ -184,6 +184,14 @@ pub async fn run_main(
         }
     };
 
+    // Read mid‑turn approval mode flag from config.toml ([tui]).
+    // Read mid‑turn approval mode flag from config.toml ([tui]).
+    let midturn_enabled_for_call = config_toml
+        .tui
+        .as_ref()
+        .and_then(|t| t.midturn_approval_mode_enabled)
+        .unwrap_or(false);
+
     let cli_profile_override = cli.config_profile.clone();
     let active_profile = cli_profile_override
         .clone()
@@ -247,6 +255,7 @@ pub async fn run_main(
         internal_storage,
         active_profile,
         should_show_trust_screen,
+        midturn_enabled_for_call,
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))
@@ -258,6 +267,7 @@ async fn run_ratatui_app(
     mut internal_storage: InternalStorage,
     active_profile: Option<String>,
     should_show_trust_screen: bool,
+    midturn_enabled_for_call: bool,
 ) -> color_eyre::Result<AppExitInfo> {
     let mut config = config;
     color_eyre::install()?;
@@ -421,6 +431,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         resume_selection,
+        midturn_enabled_for_call,
     )
     .await;
 

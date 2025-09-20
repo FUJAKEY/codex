@@ -64,6 +64,8 @@ pub(crate) struct BottomPane {
     status: Option<StatusIndicatorWidget>,
     /// Queued user messages to show under the status indicator.
     queued_user_messages: Vec<String>,
+    /// Gate: enable 'c' hotkey to change approval/sandbox mode mid‑turn inside approval modal.
+    midturn_approval_mode_enabled: bool,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -73,6 +75,7 @@ pub(crate) struct BottomPaneParams {
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) placeholder_text: String,
     pub(crate) disable_paste_burst: bool,
+    pub(crate) midturn_approval_mode_enabled: bool,
 }
 
 impl BottomPane {
@@ -96,6 +99,7 @@ impl BottomPane {
             status: None,
             queued_user_messages: Vec::new(),
             esc_backtrack_hint: false,
+            midturn_approval_mode_enabled: params.midturn_approval_mode_enabled,
         }
     }
 
@@ -388,7 +392,11 @@ impl BottomPane {
         };
 
         // Otherwise create a new approval modal overlay.
-        let modal = ApprovalModalView::new(request, self.app_event_tx.clone());
+        let modal = ApprovalModalView::new(
+            request,
+            self.app_event_tx.clone(),
+            self.midturn_approval_mode_enabled,
+        );
         self.pause_status_timer_for_modal();
         self.active_view = Some(Box::new(modal));
         self.request_redraw()
@@ -519,6 +527,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            midturn_approval_mode_enabled: false,
         });
         pane.push_approval_request(exec_request());
         assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
@@ -539,6 +548,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            midturn_approval_mode_enabled: false,
         });
 
         // Create an approval modal (active view).
@@ -570,6 +580,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            midturn_approval_mode_enabled: false,
         });
 
         // Start a running task so the status indicator is active above the composer.
@@ -638,6 +649,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            midturn_approval_mode_enabled: false,
         });
 
         // Begin a task: show initial status.
@@ -669,6 +681,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            midturn_approval_mode_enabled: false,
         });
 
         // Activate spinner (status view replaces composer) with no live ring.
@@ -720,6 +733,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            midturn_approval_mode_enabled: false,
         });
 
         pane.set_task_running(true);

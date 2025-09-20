@@ -285,6 +285,7 @@ async fn helpers_are_available_and_do_not_panic() {
         initial_images: Vec::new(),
         enhanced_keys_supported: false,
         auth_manager,
+        midturn_approval_mode_enabled: false,
     };
     let mut w = ChatWidget::new(init, conversation_manager);
     // Basic construction sanity.
@@ -308,6 +309,7 @@ fn make_chatwidget_manual() -> (
         enhanced_keys_supported: false,
         placeholder_text: "Ask Codex to do anything".to_string(),
         disable_paste_burst: false,
+        midturn_approval_mode_enabled: false,
     });
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
     let widget = ChatWidget {
@@ -721,6 +723,24 @@ fn disabled_slash_command_while_task_running_snapshot() {
     );
     let blob = lines_to_single_string(cells.last().unwrap());
     assert_snapshot!(blob);
+}
+
+#[test]
+fn approvals_allowed_while_task_running() {
+    // Build a chat widget and simulate an active task
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane.set_task_running(true);
+
+    // Dispatch a command that we want to allow during a task (e.g., /approvals)
+    chat.dispatch_command(SlashCommand::Approvals);
+
+    // Drain history; previously, disallowed commands emit an error cell. For
+    // /approvals, we expect no error history to be emitted upon dispatch.
+    let cells = drain_insert_history(&mut rx);
+    assert!(
+        cells.is_empty(),
+        "expected no error history cell for '/approvals' while a task runs"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
