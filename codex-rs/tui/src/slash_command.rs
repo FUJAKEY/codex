@@ -23,8 +23,10 @@ pub enum SlashCommand {
     Status,
     Limits,
     Mcp,
+    Comment,
     Logout,
     Quit,
+    Experimental,
     #[cfg(debug_assertions)]
     TestApproval,
 }
@@ -45,7 +47,9 @@ impl SlashCommand {
             SlashCommand::Model => "choose what model and reasoning effort to use",
             SlashCommand::Approvals => "choose what Codex can do without approval",
             SlashCommand::Mcp => "list configured MCP tools",
+            SlashCommand::Comment => "open comments page in browser",
             SlashCommand::Logout => "log out of Codex",
+            SlashCommand::Experimental => "toggle experimental TUI features",
             #[cfg(debug_assertions)]
             SlashCommand::TestApproval => "test approval request",
         }
@@ -65,6 +69,7 @@ impl SlashCommand {
             | SlashCommand::Compact
             | SlashCommand::Model
             | SlashCommand::Approvals
+            | SlashCommand::Experimental
             | SlashCommand::Review
             | SlashCommand::Logout => false,
             SlashCommand::Diff
@@ -72,6 +77,7 @@ impl SlashCommand {
             | SlashCommand::Status
             | SlashCommand::Limits
             | SlashCommand::Mcp
+            | SlashCommand::Comment
             | SlashCommand::Quit => true,
 
             #[cfg(debug_assertions)]
@@ -81,6 +87,12 @@ impl SlashCommand {
 }
 
 /// Return all built-in commands in a Vec paired with their command string.
-pub fn built_in_slash_commands() -> Vec<(&'static str, SlashCommand)> {
-    SlashCommand::iter().map(|c| (c.command(), c)).collect()
+pub fn built_in_slash_commands(include_comment: bool) -> Vec<(&'static str, SlashCommand)> {
+    SlashCommand::iter()
+        .filter(|c| match c {
+            SlashCommand::Comment => include_comment,
+            _ => true,
+        })
+        .map(|c| (c.command(), c))
+        .collect()
 }
