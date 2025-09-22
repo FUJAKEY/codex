@@ -12,10 +12,11 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::WidgetRef;
 
+use crate::accessibility::animations_enabled;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::key_hint;
-use crate::shimmer::shimmer_spans;
+use crate::shimmer::shimmer_spans_with_animation_control;
 use crate::tui::FrameRequester;
 use crate::ui_consts::LIVE_PREFIX_COLS;
 
@@ -24,6 +25,7 @@ pub(crate) struct StatusIndicatorWidget {
     header: String,
     /// Queued user messages to display under the status line.
     queued_messages: Vec<String>,
+    animations_enabled: bool,
 
     elapsed_running: Duration,
     last_resume_at: Instant,
@@ -51,9 +53,11 @@ fn fmt_elapsed_compact(elapsed_secs: u64) -> String {
 
 impl StatusIndicatorWidget {
     pub(crate) fn new(app_event_tx: AppEventSender, frame_requester: FrameRequester) -> Self {
+        let animations_enabled = animations_enabled();
         Self {
             header: String::from("Working"),
             queued_messages: Vec::new(),
+            animations_enabled,
             elapsed_running: Duration::ZERO,
             last_resume_at: Instant::now(),
             is_paused: false,
@@ -154,14 +158,22 @@ impl WidgetRef for StatusIndicatorWidget {
         }
 
         // Schedule next animation frame.
-        self.frame_requester
-            .schedule_frame_in(Duration::from_millis(32));
+        if self.animations_enabled {
+            self.frame_requester
+                .schedule_frame_in(Duration::from_millis(32));
+        } else {
+            self.frame_requester
+                .schedule_frame_in(Duration::from_secs(1));
+        }
         let elapsed = self.elapsed_seconds();
         let pretty_elapsed = fmt_elapsed_compact(elapsed);
 
         // Plain rendering: no borders or padding so the live cell is visually indistinguishable from terminal scrollback.
         let mut spans = vec![" ".repeat(LIVE_PREFIX_COLS as usize).into()];
-        spans.extend(shimmer_spans(&self.header));
+        spans.extend(shimmer_spans_with_animation_control(
+            &self.header,
+            self.animations_enabled,
+        ));
         spans.extend(vec![
             " ".into(),
             format!("({pretty_elapsed} • ").dim(),
@@ -201,6 +213,7 @@ impl WidgetRef for StatusIndicatorWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accessibility::with_cli_animations_disabled_for_tests;
     use crate::app_event::AppEvent;
     use crate::app_event_sender::AppEventSender;
     use ratatui::Terminal;
@@ -227,65 +240,84 @@ mod tests {
 
     #[test]
     fn renders_with_working_header() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
+        with_cli_animations_disabled_for_tests(false, || {
+            let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+            let tx = AppEventSender::new(tx_raw);
+            let w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
 
-        // Render into a fixed-size test terminal and snapshot the backend.
-        let mut terminal = Terminal::new(TestBackend::new(80, 2)).expect("terminal");
-        terminal
-            .draw(|f| w.render_ref(f.area(), f.buffer_mut()))
-            .expect("draw");
-        insta::assert_snapshot!(terminal.backend());
+            // Render into a fixed-size test terminal and snapshot the backend.
+            let mut terminal = Terminal::new(TestBackend::new(80, 2)).expect("terminal");
+            terminal
+                .draw(|f| w.render_ref(f.area(), f.buffer_mut()))
+                .expect("draw");
+            insta::assert_snapshot!(terminal.backend());
+        });
     }
 
     #[test]
     fn renders_truncated() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
+        with_cli_animations_disabled_for_tests(false, || {
+            let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+            let tx = AppEventSender::new(tx_raw);
+            let w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
 
-        // Render into a fixed-size test terminal and snapshot the backend.
-        let mut terminal = Terminal::new(TestBackend::new(20, 2)).expect("terminal");
-        terminal
-            .draw(|f| w.render_ref(f.area(), f.buffer_mut()))
-            .expect("draw");
-        insta::assert_snapshot!(terminal.backend());
+            // Render into a fixed-size test terminal and snapshot the backend.
+            let mut terminal = Terminal::new(TestBackend::new(20, 2)).expect("terminal");
+            terminal
+                .draw(|f| w.render_ref(f.area(), f.buffer_mut()))
+                .expect("draw");
+            insta::assert_snapshot!(terminal.backend());
+        });
     }
 
     #[test]
     fn renders_with_queued_messages() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let mut w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
-        w.set_queued_messages(vec!["first".to_string(), "second".to_string()]);
+        with_cli_animations_disabled_for_tests(false, || {
+            let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+            let tx = AppEventSender::new(tx_raw);
+            let mut w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
+            w.set_queued_messages(vec!["first".to_string(), "second".to_string()]);
 
-        // Render into a fixed-size test terminal and snapshot the backend.
-        let mut terminal = Terminal::new(TestBackend::new(80, 8)).expect("terminal");
-        terminal
-            .draw(|f| w.render_ref(f.area(), f.buffer_mut()))
-            .expect("draw");
-        insta::assert_snapshot!(terminal.backend());
+            // Render into a fixed-size test terminal and snapshot the backend.
+            let mut terminal = Terminal::new(TestBackend::new(80, 8)).expect("terminal");
+            terminal
+                .draw(|f| w.render_ref(f.area(), f.buffer_mut()))
+                .expect("draw");
+            insta::assert_snapshot!(terminal.backend());
+        });
     }
 
     #[test]
     fn timer_pauses_when_requested() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let mut widget = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
+        with_cli_animations_disabled_for_tests(false, || {
+            let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+            let tx = AppEventSender::new(tx_raw);
+            let mut widget =
+                StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
 
-        let baseline = Instant::now();
-        widget.last_resume_at = baseline;
+            let baseline = Instant::now();
+            widget.last_resume_at = baseline;
 
-        let before_pause = widget.elapsed_seconds_at(baseline + Duration::from_secs(5));
-        assert_eq!(before_pause, 5);
+            let before_pause = widget.elapsed_seconds_at(baseline + Duration::from_secs(5));
+            assert_eq!(before_pause, 5);
 
-        widget.pause_timer_at(baseline + Duration::from_secs(5));
-        let paused_elapsed = widget.elapsed_seconds_at(baseline + Duration::from_secs(10));
-        assert_eq!(paused_elapsed, before_pause);
+            widget.pause_timer_at(baseline + Duration::from_secs(5));
+            let paused_elapsed = widget.elapsed_seconds_at(baseline + Duration::from_secs(10));
+            assert_eq!(paused_elapsed, before_pause);
 
-        widget.resume_timer_at(baseline + Duration::from_secs(10));
-        let after_resume = widget.elapsed_seconds_at(baseline + Duration::from_secs(13));
-        assert_eq!(after_resume, before_pause + 3);
+            widget.resume_timer_at(baseline + Duration::from_secs(10));
+            let after_resume = widget.elapsed_seconds_at(baseline + Duration::from_secs(13));
+            assert_eq!(after_resume, before_pause + 3);
+        });
+    }
+
+    #[test]
+    fn disables_animation_when_cli_flag_is_set() {
+        with_cli_animations_disabled_for_tests(true, || {
+            let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+            let tx = AppEventSender::new(tx_raw);
+            let widget = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
+            assert_eq!(widget.animations_enabled, false);
+        });
     }
 }

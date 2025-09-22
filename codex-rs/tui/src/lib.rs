@@ -3,6 +3,7 @@
 // alternate‑screen mode starts; that file opts‑out locally via `allow`.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![deny(clippy::disallowed_methods)]
+pub use accessibility::is_screen_reader_active;
 use app::App;
 pub use app::AppExitInfo;
 use codex_core::AuthManager;
@@ -29,6 +30,7 @@ use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
+mod accessibility;
 mod app;
 mod app_backtrack;
 mod app_event;
@@ -73,6 +75,7 @@ mod wrapping;
 #[cfg(not(debug_assertions))]
 mod updates;
 
+use crate::accessibility::set_cli_animations_disabled;
 use crate::new_model_popup::ModelUpgradeDecision;
 use crate::new_model_popup::run_model_upgrade_popup;
 use crate::onboarding::TrustDirectorySelection;
@@ -262,6 +265,8 @@ async fn run_ratatui_app(
 ) -> color_eyre::Result<AppExitInfo> {
     let mut config = config;
     color_eyre::install()?;
+
+    set_cli_animations_disabled(cli.no_animations);
 
     // Forward panic reports through tracing so they appear in the UI status
     // line, but do not swallow the default/color-eyre panic handler.
