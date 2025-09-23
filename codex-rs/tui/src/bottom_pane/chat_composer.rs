@@ -87,6 +87,8 @@ pub(crate) struct ChatComposer {
     // When true, disables paste-burst logic and inserts characters immediately.
     disable_paste_burst: bool,
     custom_prompts: Vec<CustomPrompt>,
+    next_history_override: Option<String>,
+    custom_prompts_loaded: bool,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -130,6 +132,8 @@ impl ChatComposer {
             paste_burst: PasteBurst::default(),
             disable_paste_burst: false,
             custom_prompts: Vec::new(),
+            next_history_override: None,
+            custom_prompts_loaded: false,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -416,29 +420,42 @@ impl ChatComposer {
                 ..
             } => {
                 if let Some(sel) = popup.selected_item() {
-                    // Clear textarea so no residual text remains.
-                    self.textarea.set_text("");
-                    // Capture any needed data from popup before clearing it.
-                    let prompt_content = match sel {
-                        CommandItem::UserPrompt(idx) => {
-                            popup.prompt_content(idx).map(str::to_string)
-                        }
-                        _ => None,
-                    };
-                    // Hide popup since an action has been dispatched.
-                    self.active_popup = ActivePopup::None;
-
+                    // Capture raw input for potential history override and compute action
+                    let raw_input = self.textarea.text().to_string();
+                    let mut maybe_builtin: Option<SlashCommand> = None;
+                    let mut maybe_submission: Option<String> = None;
                     match sel {
                         CommandItem::Builtin(cmd) => {
-                            return (InputResult::Command(cmd), true);
+                            maybe_builtin = Some(cmd);
                         }
-                        CommandItem::UserPrompt(_) => {
-                            if let Some(contents) = prompt_content {
-                                return (InputResult::Submitted(contents), true);
-                            }
-                            return (InputResult::None, true);
+                        CommandItem::UserPrompt(idx) => {
+                            let template = popup
+                                .prompt_content(idx)
+                                .map(|s| s.to_string())
+                                .unwrap_or_default();
+                            let prompt_name = popup.prompt_name(idx).unwrap_or("");
+                            let args = Self::extract_args_from_input(&raw_input);
+                            let final_text =
+                                Self::substitute_prompt_args(&template, prompt_name, &args);
+                            maybe_submission = Some(final_text);
+                            // For custom prompts, record the raw input as a local history entry
+                            // and also set a one-shot override for persistent history.
+                            self.history.record_local_submission(&raw_input);
+                            self.set_next_history_override(raw_input);
                         }
                     }
+
+                    // Clear textarea and hide popup since an action has been dispatched.
+                    self.textarea.set_text("");
+                    self.active_popup = ActivePopup::None;
+
+                    if let Some(cmd) = maybe_builtin {
+                        return (InputResult::Command(cmd), true);
+                    }
+                    if let Some(text) = maybe_submission {
+                        return (InputResult::Submitted(text), true);
+                    }
+                    return (InputResult::None, true);
                 }
                 // Fallback to default newline handling if no command selected.
                 self.handle_key_event_without_popup(key_event)
@@ -744,6 +761,11 @@ impl ChatComposer {
                 code: KeyCode::Up | KeyCode::Down,
                 ..
             } => {
+                // Block history search for slash commands until custom prompts have loaded
+                let first_line = self.textarea.text().lines().next().unwrap_or("");
+                if first_line.starts_with('/') && !self.custom_prompts_loaded {
+                    return self.handle_input_basic(key_event);
+                }
                 if self
                     .history
                     .should_handle_navigation(self.textarea.text(), self.textarea.cursor())
@@ -828,6 +850,27 @@ impl ChatComposer {
                     return (InputResult::None, true);
                 }
                 if !text.is_empty() {
+                    // If this is a typed custom prompt like "/name ..." and prompts are loaded,
+                    // expand it immediately instead of sending the literal slash text.
+                    if text.starts_with('/') && self.custom_prompts_loaded {
+                        // Extract the command token and args
+                        let first = text.lines().next().unwrap_or("");
+                        let stripped = first.trim_start_matches('/');
+                        let mut parts = stripped.split_whitespace();
+                        let cmd_token = parts.next().unwrap_or("");
+                        if let Some(prompt) =
+                            self.custom_prompts.iter().find(|p| p.name == cmd_token)
+                        {
+                            let args = Self::extract_args_from_input(&text);
+                            let final_text =
+                                Self::substitute_prompt_args(&prompt.content, cmd_token, &args);
+                            let full_text = first.to_string();
+                            self.history.record_local_submission(&full_text);
+                            self.set_next_history_override(full_text);
+                            return (InputResult::Submitted(final_text), true);
+                        }
+                    }
+                    // Otherwise, record literal text in local (in-session) history
                     self.history.record_local_submission(&text);
                 }
                 // Do not clear attached_images here; ChatWidget drains them via take_recent_submission_images().
@@ -1167,9 +1210,102 @@ impl ChatComposer {
 
     pub(crate) fn set_custom_prompts(&mut self, prompts: Vec<CustomPrompt>) {
         self.custom_prompts = prompts.clone();
+        self.custom_prompts_loaded = true;
         if let ActivePopup::Command(popup) = &mut self.active_popup {
             popup.set_prompts(prompts);
         }
+    }
+
+    pub(crate) fn set_next_history_override(&mut self, text: String) {
+        self.next_history_override = Some(text);
+    }
+
+    pub(crate) fn take_next_history_override(&mut self) -> Option<String> {
+        self.next_history_override.take()
+    }
+    /// Extract positional arguments from raw input that may contain a slash command.
+    /// - Parses args from the first line after the command token (e.g. "/name arg1 arg2").
+    /// - If there is multiline remainder, it is appended to the last positional argument
+    ///   with a leading '\n'. If there are no positionals, the remainder becomes a single
+    ///   argument starting with a leading '\n'. This preserves the user's exact newline
+    ///   boundary when `$ARGUMENTS` is expanded with a simple join(" ").
+    fn extract_args_from_input(raw_input: &str) -> Vec<String> {
+        let first_line = raw_input.lines().next().unwrap_or("");
+        let Some(stripped) = first_line.strip_prefix('/') else {
+            return Vec::new();
+        };
+        let token = stripped.trim_start();
+        let mut parts = token.split_whitespace();
+        let _cmd = parts.next();
+        let mut args: Vec<String> = parts.map(|s| s.to_string()).collect();
+        if let Some(rest) = raw_input.splitn(2, '\n').nth(1) {
+            if !rest.is_empty() {
+                if let Some(last) = args.last_mut() {
+                    last.push('\n');
+                    last.push_str(rest);
+                } else {
+                    args.push(format!("\n{rest}"));
+                }
+            }
+        }
+        args
+    }
+
+    /// Substitute $ARGUMENTS and $0..$9 tokens in `template`.
+    /// - `$0` expands to the `prompt_name`.
+    /// - `$1..$9` expand to positional arguments if present; otherwise the
+    ///   token is preserved literally (e.g., `$9`).
+    /// - `$ARGUMENTS` expands to all args joined by a single space; if there
+    ///   are no args it is preserved literally as `$ARGUMENTS`.
+    fn substitute_prompt_args(template: &str, prompt_name: &str, args: &[String]) -> String {
+        let mut out = String::with_capacity(template.len());
+        let bytes = template.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'$' {
+                // Try $ARGUMENTS
+                if template[i..].starts_with("$ARGUMENTS") {
+                    if args.is_empty() {
+                        out.push_str("$ARGUMENTS");
+                    } else {
+                        out.push_str(&args.join(" "));
+                    }
+                    i += "$ARGUMENTS".len();
+                    continue;
+                }
+                // Try $0..$9
+                if i + 1 < bytes.len() {
+                    let d = bytes[i + 1];
+                    if d.is_ascii_digit() {
+                        if d == b'0' {
+                            out.push_str(prompt_name);
+                        } else {
+                            let idx = (d - b'1') as usize;
+                            if let Some(val) = args.get(idx) {
+                                out.push_str(val);
+                            } else {
+                                out.push('$');
+                                out.push(char::from(d));
+                            }
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
+                // Not a recognized token, emit '$' literally
+                out.push('$');
+                i += 1;
+            } else {
+                // Advance over a full UTF-8 character instead of a single byte.
+                if let Some(ch) = template[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Synchronize `self.file_search_popup` with the current text in the textarea.
@@ -2333,6 +2469,7 @@ mod tests {
             name: "my-prompt".to_string(),
             path: "/tmp/my-prompt.md".to_string().into(),
             content: prompt_text.to_string(),
+            description: None,
         }]);
 
         type_chars_humanlike(
@@ -2444,5 +2581,142 @@ mod tests {
 
         assert_eq!(composer.textarea.text(), "z".repeat(count));
         assert!(composer.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn custom_prompt_substitutes_arguments_joined() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let template = "Hello, $ARGUMENTS. My name is codex.";
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        // Use a custom prompt named "test" backed by a test.md path.
+        composer.set_custom_prompts(vec![CustomPrompt {
+            name: "test".to_string(),
+            path: "/tmp/test.md".to_string().into(),
+            content: template.to_string(),
+            description: None,
+        }]);
+
+        // Provide a multiline input; the remaining lines should be appended as
+        // the last argument so that $ARGUMENTS covers the full input.
+        composer.handle_paste("/test Claude\nand a second line".to_string());
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            InputResult::Submitted(
+                "Hello, Claude\nand a second line. My name is codex.".to_string()
+            ),
+            result
+        );
+    }
+
+    #[test]
+    fn custom_prompt_substitutes_positional_and_prompt_name() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let template = "[$0] Hello, $1. My name is $2.";
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_custom_prompts(vec![CustomPrompt {
+            name: "test1".to_string(),
+            path: "/tmp/test1.md".to_string().into(),
+            content: template.to_string(),
+            description: None,
+        }]);
+        type_chars_humanlike(
+            &mut composer,
+            &[
+                '/', 't', 'e', 's', 't', '1', ' ', 'C', 'l', 'a', 'u', 'd', 'e', ' ', 'C', 'o',
+                'd', 'e', 'x',
+            ],
+        );
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            InputResult::Submitted("[test1] Hello, Claude. My name is Codex.".to_string()),
+            result
+        );
+    }
+
+    #[test]
+    fn custom_prompt_preserves_missing_positionals() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let template = "A[$1][$2][$9] end";
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_custom_prompts(vec![CustomPrompt {
+            name: "test2".to_string(),
+            path: "/tmp/test2.md".to_string().into(),
+            content: template.to_string(),
+            description: None,
+        }]);
+
+        // Provide only one positional argument; $2 and $9 should remain verbatim.
+        type_chars_humanlike(&mut composer, &['/', 't', 'e', 's', 't', '2', ' ', 'X']);
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            InputResult::Submitted("A[X][$2][$9] end".to_string()),
+            result
+        );
+    }
+
+    #[test]
+    fn substitute_prompt_args_allows_multiline_arguments() {
+        // $ARGUMENTS should preserve embedded newlines inside individual args.
+        let template = "X:$ARGUMENTS:Y";
+        let prompt_name = "name";
+        let args = vec!["one\nline2".to_string(), "last".to_string()];
+        let out = ChatComposer::substitute_prompt_args(template, prompt_name, &args);
+        assert_eq!(out, "X:one\nline2 last:Y");
+    }
+
+    #[test]
+    fn substitute_prompt_args_preserves_utf8_and_expands_tokens() {
+        // Non-ASCII characters should remain intact after substitution.
+        let template = "안녕하세요 세계 — $0 — $1 — $ARGUMENTS — 끝";
+        let prompt_name = "테스트명";
+        let args = vec!["첫째".to_string(), "둘째".to_string()];
+        let out = ChatComposer::substitute_prompt_args(template, prompt_name, &args);
+        assert_eq!(out, "안녕하세요 세계 — 테스트명 — 첫째 — 첫째 둘째 — 끝");
+    }
+
+    #[test]
+    fn substitute_prompt_args_preserves_literal_when_missing() {
+        // When arguments are missing, $ARGUMENTS and $9 should be preserved literally.
+        let template = "Привет мир $ARGUMENTS $9";
+        let prompt_name = "имя";
+        let args: Vec<String> = vec![];
+        let out = ChatComposer::substitute_prompt_args(template, prompt_name, &args);
+        assert_eq!(out, "Привет мир $ARGUMENTS $9");
     }
 }
