@@ -15,6 +15,7 @@ use codex_core::protocol::AgentReasoningRawContentDeltaEvent;
 use codex_core::protocol::AgentReasoningRawContentEvent;
 use codex_core::protocol::ApplyPatchApprovalRequestEvent;
 use codex_core::protocol::BackgroundEventEvent;
+use codex_core::protocol::CompactApprovalRequestEvent;
 use codex_core::protocol::ErrorEvent;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
@@ -441,6 +442,12 @@ impl ChatWidget {
             |q| q.push_apply_patch_approval(id, ev),
             |s| s.handle_apply_patch_approval_now(id2, ev2),
         );
+    }
+
+    fn on_compact_approval_request(&mut self, ev: CompactApprovalRequestEvent) {
+        let request = ApprovalRequest::Compact { reason: ev.reason };
+        self.bottom_pane.push_approval_request(request);
+        self.request_redraw();
     }
 
     fn on_exec_command_begin(&mut self, ev: ExecCommandBeginEvent) {
@@ -1278,6 +1285,7 @@ impl ChatWidget {
             EventMsg::ApplyPatchApprovalRequest(ev) => {
                 self.on_apply_patch_approval_request(id.unwrap_or_default(), ev)
             }
+            EventMsg::CompactApprovalRequest(ev) => self.on_compact_approval_request(ev),
             EventMsg::ExecCommandBegin(ev) => self.on_exec_command_begin(ev),
             EventMsg::ExecCommandOutputDelta(delta) => self.on_exec_command_output_delta(delta),
             EventMsg::PatchApplyBegin(ev) => self.on_patch_apply_begin(ev),

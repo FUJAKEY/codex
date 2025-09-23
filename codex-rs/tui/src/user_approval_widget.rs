@@ -44,6 +44,9 @@ pub(crate) enum ApprovalRequest {
         reason: Option<String>,
         grant_root: Option<PathBuf>,
     },
+    Compact {
+        reason: String,
+    },
 }
 
 /// Options displayed in the *select* mode.
@@ -96,6 +99,24 @@ static PATCH_SELECT_OPTIONS: LazyLock<Vec<SelectOption>> = LazyLock::new(|| {
     ]
 });
 
+// Compact confirmation – simple Yes/No prompt.
+static COMPACT_SELECT_OPTIONS: LazyLock<Vec<SelectOption>> = LazyLock::new(|| {
+    vec![
+        SelectOption {
+            label: Line::from(vec!["Y".underlined(), "es".into()]),
+            description: "Run compact now to continue",
+            key: KeyCode::Char('y'),
+            decision: ReviewDecision::Approved,
+        },
+        SelectOption {
+            label: Line::from(vec!["N".underlined(), "o".into()]),
+            description: "Cancel; keep the transcript as-is",
+            key: KeyCode::Char('n'),
+            decision: ReviewDecision::Abort,
+        },
+    ]
+});
+
 /// A modal prompting the user to approve or deny the pending request.
 pub(crate) struct UserApprovalWidget {
     approval_request: ApprovalRequest,
@@ -142,12 +163,17 @@ impl UserApprovalWidget {
 
                 Paragraph::new(contents).wrap(Wrap { trim: false })
             }
+            ApprovalRequest::Compact { reason, .. } => {
+                let contents: Vec<Line> = vec![Line::from(reason.clone()), "".into()];
+                Paragraph::new(contents).wrap(Wrap { trim: false })
+            }
         };
 
         Self {
             select_options: match &approval_request {
                 ApprovalRequest::Exec { .. } => &COMMAND_SELECT_OPTIONS,
                 ApprovalRequest::ApplyPatch { .. } => &PATCH_SELECT_OPTIONS,
+                ApprovalRequest::Compact { .. } => &COMPACT_SELECT_OPTIONS,
             },
             approval_request,
             app_event_tx,
@@ -294,6 +320,9 @@ impl UserApprovalWidget {
             ApprovalRequest::ApplyPatch { .. } => {
                 // No history line for patch approval decisions.
             }
+            ApprovalRequest::Compact { .. } => {
+                // No history line for compact approval decisions. That's handled by compact task itself.
+            }
         }
 
         let op = match &self.approval_request {
@@ -305,6 +334,7 @@ impl UserApprovalWidget {
                 id: id.clone(),
                 decision,
             },
+            ApprovalRequest::Compact { .. } => Op::Compact,
         };
 
         self.app_event_tx.send(AppEvent::CodexOp(op));
@@ -357,6 +387,7 @@ impl WidgetRef for &UserApprovalWidget {
         let title = match &self.approval_request {
             ApprovalRequest::Exec { .. } => "Allow command?",
             ApprovalRequest::ApplyPatch { .. } => "Apply changes?",
+            ApprovalRequest::Compact { .. } => "Run compact?",
         };
         Line::from(title).render(title_area, buf);
 

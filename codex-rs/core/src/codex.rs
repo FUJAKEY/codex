@@ -87,6 +87,7 @@ use crate::protocol::AgentReasoningSectionBreakEvent;
 use crate::protocol::ApplyPatchApprovalRequestEvent;
 use crate::protocol::AskForApproval;
 use crate::protocol::BackgroundEventEvent;
+use crate::protocol::CompactApprovalRequestEvent;
 use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
@@ -1956,6 +1957,19 @@ async fn run_turn(
                 return Err(e);
             }
             Err(e) => {
+                // If we hit a context/window limit error, ask the UI to
+                // offer a compact confirmation and stop retrying this turn.
+                if matches!(e, CodexErr::ContextLengthExceeded(_)) {
+                    let event = Event {
+                        id: sub_id.clone(),
+                        msg: EventMsg::CompactApprovalRequest(CompactApprovalRequestEvent {
+                            reason: "The chat has exceeded its limits. To continue, you need to compact the chat. Confirm running compact?".to_string(),
+                        }),
+                    };
+                    sess.send_event(event).await;
+                    // Non-transient – do not retry this turn further; let UI prompt.
+                    return Err(e);
+                }
                 // Use the configured provider-specific stream retry budget.
                 let max_retries = turn_context.client.get_provider().stream_max_retries();
                 if retries < max_retries {

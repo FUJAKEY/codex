@@ -478,6 +478,10 @@ pub enum EventMsg {
 
     ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent),
 
+    /// Request user confirmation to run a compact operation to reduce the
+    /// conversation context after encountering model context/window limits.
+    CompactApprovalRequest(CompactApprovalRequestEvent),
+
     BackgroundEvent(BackgroundEventEvent),
 
     /// Notification that a model stream experienced an error or disconnect
@@ -538,6 +542,11 @@ pub struct TaskCompleteEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 pub struct TaskStartedEvent {
     pub model_context_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct CompactApprovalRequestEvent {
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, TS)]
