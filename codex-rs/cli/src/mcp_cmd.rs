@@ -164,7 +164,8 @@ fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Result<(
                 command: command_bin,
                 args: command_args,
                 env: env_map,
-                startup_timeout_ms: None,
+                startup_timeout_sec: None,
+                tool_timeout_sec: None,
             },
         )?;
         println!(
@@ -182,7 +183,8 @@ fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Result<(
         command: command_bin,
         args: command_args,
         env: env_map,
-        startup_timeout_ms: None,
+        startup_timeout_sec: None,
+        tool_timeout_sec: None,
     };
 
     servers.insert(name.clone(), new_entry);
@@ -289,9 +291,8 @@ fn add_project_mcp_server(
         }
     }
 
-    if let Some(timeout) = entry.startup_timeout_ms {
-        let timeout = i64::try_from(timeout).context("startup_timeout_ms too large")?;
-        entry_tbl["startup_timeout_ms"] = value(timeout);
+    if let Some(timeout) = entry.startup_timeout_sec {
+        entry_tbl["startup_timeout_sec"] = value(timeout.as_secs_f64());
     }
 
     doc["mcp_servers"][name] = TomlItem::Table(entry_tbl);
@@ -343,7 +344,12 @@ fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) -> Resul
                     "command": cfg.command,
                     "args": cfg.args,
                     "env": env,
-                    "startup_timeout_ms": cfg.startup_timeout_ms,
+                    "startup_timeout_sec": cfg
+                        .startup_timeout_sec
+                        .map(|timeout| timeout.as_secs_f64()),
+                    "tool_timeout_sec": cfg
+                        .tool_timeout_sec
+                        .map(|timeout| timeout.as_secs_f64()),
                 })
             })
             .collect();
@@ -438,7 +444,12 @@ fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Result<(
             "command": server.command,
             "args": server.args,
             "env": env,
-            "startup_timeout_ms": server.startup_timeout_ms,
+            "startup_timeout_sec": server
+                .startup_timeout_sec
+                .map(|timeout| timeout.as_secs_f64()),
+            "tool_timeout_sec": server
+                .tool_timeout_sec
+                .map(|timeout| timeout.as_secs_f64()),
         }))?;
         println!("{output}");
         return Ok(());
@@ -466,8 +477,11 @@ fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Result<(
         }
     };
     println!("  env: {env_display}");
-    if let Some(timeout) = server.startup_timeout_ms {
-        println!("  startup_timeout_ms: {timeout}");
+    if let Some(timeout) = server.startup_timeout_sec {
+        println!("  startup_timeout_sec: {}", timeout.as_secs_f64());
+    }
+    if let Some(timeout) = server.tool_timeout_sec {
+        println!("  tool_timeout_sec: {}", timeout.as_secs_f64());
     }
     println!("  remove: codex mcp remove {}", get_args.name);
 
