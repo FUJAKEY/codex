@@ -66,7 +66,6 @@ struct Error {
 
     // Optional fields available on "usage_limit_reached" and "usage_not_included" errors
     plan_type: Option<PlanType>,
-    resets_in_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +331,8 @@ impl ModelClient {
 
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         let rate_limit_snapshot = parse_rate_limit_snapshot(res.headers());
+                        let header_reset_hint =
+                            rate_limit_snapshot.as_ref().and_then(rate_limit_reset_hint);
                         let body = res.json::<ErrorResponse>().await.ok();
                         if let Some(ErrorResponse { error }) = body {
                             if error.r#type.as_deref() == Some("usage_limit_reached") {
@@ -341,10 +342,9 @@ impl ModelClient {
                                 let plan_type = error
                                     .plan_type
                                     .or_else(|| auth.as_ref().and_then(CodexAuth::get_plan_type));
-                                let resets_in_seconds = error.resets_in_seconds;
                                 return Err(CodexErr::UsageLimitReached(UsageLimitReachedError {
                                     plan_type,
-                                    resets_in_seconds,
+                                    resets_in_seconds: header_reset_hint,
                                     rate_limits: rate_limit_snapshot,
                                 }));
                             } else if error.r#type.as_deref() == Some("usage_not_included") {
@@ -516,6 +516,21 @@ fn parse_rate_limit_snapshot(headers: &HeaderMap) -> Option<RateLimitSnapshot> {
     }
 
     Some(RateLimitSnapshot { primary, secondary })
+}
+
+fn rate_limit_reset_hint(snapshot: &RateLimitSnapshot) -> Option<u64> {
+    [snapshot.primary.as_ref(), snapshot.secondary.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter(|window| window.used_percent >= 100.0)
+        .filter_map(|window| {
+            window.resets_in_seconds.or_else(|| {
+                window
+                    .window_minutes
+                    .map(|minutes| minutes.saturating_mul(60))
+            })
+        })
+        .max()
 }
 
 fn parse_header_f64(headers: &HeaderMap, name: &str) -> Option<f64> {
@@ -1127,7 +1142,6 @@ mod tests {
             message: Some("Rate limit reached for gpt-5 in organization org- on tokens per min (TPM): Limit 1, Used 1, Requested 19304. Please try again in 28ms. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
             plan_type: None,
-            resets_in_seconds: None
         };
 
         let delay = try_parse_retry_after(&err);
@@ -1141,7 +1155,6 @@ mod tests {
             message: Some("Rate limit reached for gpt-5 in organization <ORG> on tokens per min (TPM): Limit 30000, Used 6899, Requested 24050. Please try again in 1.898s. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
             plan_type: None,
-            resets_in_seconds: None
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs_f64(1.898)));
