@@ -81,6 +81,7 @@ use crate::history_cell::PatchEventType;
 use crate::history_cell::RateLimitSnapshotDisplay;
 use crate::markdown::append_markdown;
 use crate::slash_command::SlashCommand;
+use crate::slash_command::SlashCommandInvocation;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 // streaming internals are provided by crate::streaming and crate::markdown_stream
@@ -113,6 +114,18 @@ use codex_git_tooling::create_ghost_commit;
 use codex_git_tooling::restore_ghost_commit;
 
 const MAX_TRACKED_GHOST_COMMITS: usize = 20;
+
+const CODEX_VIM_ENV: &str = "CODEX_VIM";
+
+fn vim_kill_switch_active() -> bool {
+    match std::env::var(CODEX_VIM_ENV) {
+        Ok(value) => {
+            let lowered = value.trim().to_ascii_lowercase();
+            matches!(lowered.as_str(), "0" | "false" | "off" | "no")
+        }
+        Err(_) => false,
+    }
+}
 
 // Track information about an in-flight exec command.
 struct RunningCommand {
@@ -829,6 +842,14 @@ impl ChatWidget {
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
         let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), conversation_manager);
 
+        // Enable Vim mode if configured and kill switch not active.
+        let vim_kill_switch_active = vim_kill_switch_active();
+        let vim_mode_enabled = !vim_kill_switch_active
+            && matches!(
+                config.tui.editor_keymap,
+                Some(codex_core::config_types::EditorKeymap::Vim)
+            );
+
         Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -840,6 +861,8 @@ impl ChatWidget {
                 enhanced_keys_supported,
                 placeholder_text: placeholder,
                 disable_paste_burst: config.disable_paste_burst,
+                vim_mode_enabled,
+                vim_kill_switch_active,
             }),
             active_cell: None,
             config: config.clone(),
@@ -890,6 +913,13 @@ impl ChatWidget {
         let codex_op_tx =
             spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone());
 
+        let vim_kill_switch_active = vim_kill_switch_active();
+        let vim_mode_enabled = !vim_kill_switch_active
+            && matches!(
+                config.tui.editor_keymap,
+                Some(codex_core::config_types::EditorKeymap::Vim)
+            );
+
         Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -901,6 +931,8 @@ impl ChatWidget {
                 enhanced_keys_supported,
                 placeholder_text: placeholder,
                 disable_paste_burst: config.disable_paste_burst,
+                vim_mode_enabled,
+                vim_kill_switch_active,
             }),
             active_cell: None,
             config: config.clone(),
@@ -995,8 +1027,8 @@ impl ChatWidget {
                             self.submit_user_message(user_message);
                         }
                     }
-                    InputResult::Command(cmd) => {
-                        self.dispatch_command(cmd);
+                    InputResult::Command(invocation) => {
+                        self.dispatch_command(invocation);
                     }
                     InputResult::None => {}
                 }
@@ -1019,17 +1051,21 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn dispatch_command(&mut self, cmd: SlashCommand) {
-        if !cmd.available_during_task() && self.bottom_pane.is_task_running() {
+    fn dispatch_command(&mut self, invocation: SlashCommandInvocation) {
+        let SlashCommandInvocation { command, args } = invocation;
+        if !command.available_during_task() && self.bottom_pane.is_task_running() {
             let message = format!(
                 "'/{}' is disabled while a task is in progress.",
-                cmd.command()
+                command.command()
             );
             self.add_to_history(history_cell::new_error_event(message));
             self.request_redraw();
             return;
         }
-        match cmd {
+        match command {
+            SlashCommand::Vim => {
+                self.handle_vim_command(args);
+            }
             SlashCommand::New => {
                 self.app_event_tx.send(AppEvent::NewSession);
             }
@@ -1127,6 +1163,113 @@ impl ChatWidget {
                 }));
             }
         }
+    }
+
+    fn handle_vim_command(&mut self, args: Vec<String>) {
+        let command_label = if args.is_empty() {
+            "vim".to_string()
+        } else {
+            format!("vim {}", args.join(" "))
+        };
+
+        if self.bottom_pane.vim_kill_switch_active() {
+            match args.first().map(std::string::String::as_str) {
+                Some("status") => {
+                    let description = format!("Vim keymap is disabled ({CODEX_VIM_ENV}=0).");
+                    self.add_to_history(history_cell::new_command_feedback(
+                        &command_label,
+                        description,
+                    ));
+                }
+                Some("cheatsheet") => {
+                    self.bottom_pane.show_vim_cheatsheet();
+                    self.add_to_history(history_cell::new_command_feedback(
+                        &command_label,
+                        format!("Vim cheatsheet (read-only; {CODEX_VIM_ENV}=0)."),
+                    ));
+                }
+                _ => {
+                    let message = format!(
+                        "Vim keymap is disabled via {CODEX_VIM_ENV}=0; '/vim' commands are unavailable."
+                    );
+                    self.add_to_history(history_cell::new_error_event(message));
+                }
+            }
+            self.request_redraw();
+            return;
+        }
+
+        let message_cell = match args.first().map(std::string::String::as_str) {
+            None => {
+                let enabled = self.bottom_pane.toggle_vim_mode();
+                let description = if enabled {
+                    let mode = self
+                        .bottom_pane
+                        .vim_mode_state_label()
+                        .unwrap_or_else(|| "INSERT".to_string());
+                    format!("Vim keymap enabled ({mode}).")
+                } else {
+                    "Vim keymap disabled (standard bindings).".to_string()
+                };
+                history_cell::new_command_feedback(&command_label, description)
+            }
+            Some("cheatsheet") => {
+                self.bottom_pane.show_vim_cheatsheet();
+                history_cell::new_command_feedback(
+                    &command_label,
+                    "Showing Vim cheatsheet.".to_string(),
+                )
+            }
+            Some("on") => {
+                let changed = self.bottom_pane.set_vim_mode(true);
+                let mode = self
+                    .bottom_pane
+                    .vim_mode_state_label()
+                    .unwrap_or_else(|| "INSERT".to_string());
+                let description = if changed {
+                    format!("Vim keymap enabled ({mode}).")
+                } else {
+                    format!("Vim keymap already enabled ({mode}).")
+                };
+                history_cell::new_command_feedback(&command_label, description)
+            }
+            Some("off") => {
+                let changed = self.bottom_pane.set_vim_mode(false);
+                let description = if changed {
+                    "Vim keymap disabled (standard bindings).".to_string()
+                } else {
+                    "Vim keymap already disabled.".to_string()
+                };
+                history_cell::new_command_feedback(&command_label, description)
+            }
+            Some("status") => {
+                if self.bottom_pane.vim_mode_enabled() {
+                    let mode = self
+                        .bottom_pane
+                        .vim_mode_state_label()
+                        .unwrap_or_else(|| "INSERT".to_string());
+                    history_cell::new_command_feedback(
+                        &command_label,
+                        format!("Vim keymap is enabled ({mode})."),
+                    )
+                } else {
+                    history_cell::new_command_feedback(
+                        &command_label,
+                        "Vim keymap is disabled.".to_string(),
+                    )
+                }
+            }
+            Some(other) => {
+                let allowed = "on|off|status|cheatsheet";
+                let message = format!("Unknown '/vim' subcommand '{other}'. Expected {allowed}.");
+                self.request_redraw();
+                self.add_to_history(history_cell::new_error_event(message));
+                return;
+            }
+        };
+
+        self.add_to_history(message_cell);
+        self.request_redraw();
     }
 
     pub(crate) fn handle_paste(&mut self, text: String) {

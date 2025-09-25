@@ -118,6 +118,9 @@ pub struct Config {
     /// If unset the feature is disabled.
     pub notify: Option<Vec<String>>,
 
+    /// Collection of settings that are specific to the TUI.
+    pub tui: Tui,
+
     /// TUI notifications preference. When set, the TUI will send OSC 9 notifications on approvals
     /// and turn completions when not focused.
     pub tui_notifications: Notifications,
@@ -990,6 +993,9 @@ impl Config {
             .or(cfg.review_model)
             .unwrap_or_else(default_review_model);
 
+        let tui = cfg.tui.clone().unwrap_or_default();
+        let tui_notifications = tui.notifications.clone();
+
         let config = Self {
             model,
             review_model,
@@ -1046,11 +1052,8 @@ impl Config {
             include_view_image_tool,
             active_profile: active_profile_name,
             disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
-            tui_notifications: cfg
-                .tui
-                .as_ref()
-                .map(|t| t.notifications.clone())
-                .unwrap_or_default(),
+            tui,
+            tui_notifications,
         };
         Ok(config)
     }
@@ -1654,6 +1657,7 @@ model_verbosity = "high"
                 include_view_image_tool: true,
                 active_profile: Some("o3".to_string()),
                 disable_paste_burst: false,
+                tui: Default::default(),
                 tui_notifications: Default::default(),
             },
             o3_profile_config
@@ -1712,6 +1716,7 @@ model_verbosity = "high"
             include_view_image_tool: true,
             active_profile: Some("gpt3".to_string()),
             disable_paste_burst: false,
+            tui: Default::default(),
             tui_notifications: Default::default(),
         };
 
@@ -1785,6 +1790,7 @@ model_verbosity = "high"
             include_view_image_tool: true,
             active_profile: Some("zdr".to_string()),
             disable_paste_burst: false,
+            tui: Default::default(),
             tui_notifications: Default::default(),
         };
 
@@ -1844,6 +1850,7 @@ model_verbosity = "high"
             include_view_image_tool: true,
             active_profile: Some("gpt5".to_string()),
             disable_paste_burst: false,
+            tui: Default::default(),
             tui_notifications: Default::default(),
         };
 

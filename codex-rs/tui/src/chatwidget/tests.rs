@@ -1,11 +1,15 @@
 use super::*;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
+use crate::slash_command::SlashCommand;
+use crate::slash_command::SlashCommandInvocation;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::ConversationManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::ConfigToml;
+use codex_core::config_types::EditorKeymap;
 use codex_core::plan_tool::PlanItemArg;
 use codex_core::plan_tool::StepStatus;
 use codex_core::plan_tool::UpdatePlanArgs;
@@ -38,11 +42,13 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use insta::assert_snapshot;
+use lazy_static::lazy_static;
 use pretty_assertions::assert_eq;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -54,6 +60,42 @@ fn test_config() -> Config {
         std::env::temp_dir(),
     )
     .expect("config")
+}
+
+lazy_static! {
+    static ref ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
+struct EnvVarRestore {
+    key: &'static str,
+    original: Option<String>,
+}
+
+impl EnvVarRestore {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var(key).ok();
+        // SAFETY: tests hold ENV_LOCK while mutating the process environment.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        if let Some(ref value) = self.original {
+            // SAFETY: tests hold ENV_LOCK while mutating the process environment.
+            unsafe {
+                std::env::set_var(self.key, value);
+            }
+        } else {
+            // SAFETY: tests hold ENV_LOCK while mutating the process environment.
+            unsafe {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 }
 
 // Backward-compat shim for older session logs that predate the
@@ -291,6 +333,60 @@ async fn helpers_are_available_and_do_not_panic() {
     let _ = &mut w;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn vim_kill_switch_prevents_vim_activation() {
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let _restore = EnvVarRestore::set(super::CODEX_VIM_ENV, "0");
+
+    let mut cfg = test_config();
+    cfg.tui.editor_keymap = Some(EditorKeymap::Vim);
+
+    let conversation_manager = Arc::new(ConversationManager::with_auth(CodexAuth::from_api_key(
+        "test",
+    )));
+    let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+    let tx = AppEventSender::new(tx_raw);
+
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
+    let init = ChatWidgetInit {
+        config: cfg,
+        frame_requester: FrameRequester::test_dummy(),
+        app_event_tx: tx,
+        initial_prompt: None,
+        initial_images: Vec::new(),
+        enhanced_keys_supported: false,
+        auth_manager,
+    };
+
+    let mut chat = ChatWidget::new(init, conversation_manager);
+
+    assert!(chat.bottom_pane.vim_kill_switch_active());
+    assert!(!chat.bottom_pane.vim_mode_enabled());
+
+    chat.handle_vim_command(vec!["on".to_string()]);
+    assert!(!chat.bottom_pane.vim_mode_enabled());
+
+    chat.handle_vim_command(vec!["cheatsheet".to_string()]);
+    assert!(chat.bottom_pane.has_active_view());
+    chat.bottom_pane
+        .handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!chat.bottom_pane.has_active_view());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vim_cheatsheet_opens_and_closes() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+
+    assert!(!chat.bottom_pane.has_active_view());
+    chat.handle_vim_command(vec!["cheatsheet".to_string()]);
+    assert!(chat.bottom_pane.has_active_view());
+
+    // Esc should dismiss the cheatsheet view.
+    chat.bottom_pane
+        .handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!chat.bottom_pane.has_active_view());
+}
+
 // --- Helpers for tests that need direct construction and event draining ---
 fn make_chatwidget_manual() -> (
     ChatWidget,
@@ -308,6 +404,8 @@ fn make_chatwidget_manual() -> (
         enhanced_keys_supported: false,
         placeholder_text: "Ask Codex to do anything".to_string(),
         disable_paste_burst: false,
+        vim_mode_enabled: false,
+        vim_kill_switch_active: false,
     });
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
     let widget = ChatWidget {
@@ -966,7 +1064,7 @@ fn disabled_slash_command_while_task_running_snapshot() {
     chat.bottom_pane.set_task_running(true);
 
     // Dispatch a command that is unavailable while a task runs (e.g., /model)
-    chat.dispatch_command(SlashCommand::Model);
+    chat.dispatch_command(SlashCommandInvocation::new(SlashCommand::Model, Vec::new()));
 
     // Drain history and snapshot the rendered error line(s)
     let cells = drain_insert_history(&mut rx);

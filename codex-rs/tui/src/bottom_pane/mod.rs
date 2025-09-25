@@ -30,6 +30,7 @@ pub mod popup_consts;
 mod scroll_state;
 mod selection_popup_common;
 mod textarea;
+mod vim_cheatsheet_view;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancellationEvent {
@@ -67,6 +68,9 @@ pub(crate) struct BottomPane {
     status: Option<StatusIndicatorWidget>,
     /// Queued user messages to show under the status indicator.
     queued_user_messages: Vec<String>,
+
+    /// Global kill switch that disables Vim functionality regardless of config.
+    vim_kill_switch_active: bool,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -76,20 +80,27 @@ pub(crate) struct BottomPaneParams {
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) placeholder_text: String,
     pub(crate) disable_paste_burst: bool,
+    /// Enable Vim key bindings in the composer textarea.
+    pub(crate) vim_mode_enabled: bool,
+    /// Kill switch to fully disable Vim mode even if requested by config.
+    pub(crate) vim_kill_switch_active: bool,
 }
 
 impl BottomPane {
     const BOTTOM_PAD_LINES: u16 = 1;
     pub fn new(params: BottomPaneParams) -> Self {
         let enhanced_keys_supported = params.enhanced_keys_supported;
+        let initial_vim_enabled = params.vim_mode_enabled && !params.vim_kill_switch_active;
+        let mut composer = ChatComposer::new(
+            params.has_input_focus,
+            params.app_event_tx.clone(),
+            enhanced_keys_supported,
+            params.placeholder_text,
+            params.disable_paste_burst,
+        );
+        composer.set_vim_mode(initial_vim_enabled);
         Self {
-            composer: ChatComposer::new(
-                params.has_input_focus,
-                params.app_event_tx.clone(),
-                enhanced_keys_supported,
-                params.placeholder_text,
-                params.disable_paste_burst,
-            ),
+            composer,
             view_stack: Vec::new(),
             app_event_tx: params.app_event_tx,
             frame_requester: params.frame_requester,
@@ -99,6 +110,7 @@ impl BottomPane {
             status: None,
             queued_user_messages: Vec::new(),
             esc_backtrack_hint: false,
+            vim_kill_switch_active: params.vim_kill_switch_active,
         }
     }
 
@@ -166,6 +178,39 @@ impl BottomPane {
         } else {
             self.composer.cursor_pos(content)
         }
+    }
+
+    pub(crate) fn toggle_vim_mode(&mut self) -> bool {
+        if self.vim_kill_switch_active {
+            self.request_redraw();
+            return self.composer.vim_mode_enabled();
+        }
+        let enabled = self.composer.toggle_vim_mode();
+        self.request_redraw();
+        enabled
+    }
+
+    pub(crate) fn set_vim_mode(&mut self, enabled: bool) -> bool {
+        if self.vim_kill_switch_active && enabled {
+            return false;
+        }
+        let changed = self.composer.set_vim_mode(enabled);
+        if changed {
+            self.request_redraw();
+        }
+        changed
+    }
+
+    pub(crate) fn vim_mode_enabled(&self) -> bool {
+        self.composer.vim_mode_enabled()
+    }
+
+    pub(crate) fn vim_mode_state_label(&self) -> Option<String> {
+        self.composer.vim_mode_state_label()
+    }
+
+    pub(crate) fn vim_kill_switch_active(&self) -> bool {
+        self.vim_kill_switch_active
     }
 
     /// Forward a key event to the active view or the composer.
@@ -340,6 +385,11 @@ impl BottomPane {
         self.push_view(Box::new(view));
     }
 
+    pub(crate) fn show_vim_cheatsheet(&mut self) {
+        let view = vim_cheatsheet_view::VimCheatsheetView::new();
+        self.push_view(Box::new(view));
+    }
+
     /// Update the queued messages shown under the status header.
     pub(crate) fn set_queued_user_messages(&mut self, queued: Vec<String>) {
         self.queued_user_messages = queued.clone();
@@ -347,6 +397,11 @@ impl BottomPane {
             status.set_queued_messages(queued);
         }
         self.request_redraw();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_view(&self) -> bool {
+        self.active_view().is_some()
     }
 
     /// Update custom prompts available for the slash popup.
@@ -526,6 +581,8 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            vim_mode_enabled: false,
+            vim_kill_switch_active: false,
         });
         pane.push_approval_request(exec_request());
         assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
@@ -546,6 +603,8 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            vim_mode_enabled: false,
+            vim_kill_switch_active: false,
         });
 
         // Create an approval modal (active view).
@@ -577,6 +636,8 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            vim_mode_enabled: false,
+            vim_kill_switch_active: false,
         });
 
         // Start a running task so the status indicator is active above the composer.
@@ -645,6 +706,8 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            vim_mode_enabled: false,
+            vim_kill_switch_active: false,
         });
 
         // Begin a task: show initial status.
@@ -676,6 +739,8 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            vim_mode_enabled: false,
+            vim_kill_switch_active: false,
         });
 
         // Activate spinner (status view replaces composer) with no live ring.
@@ -727,6 +792,8 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            vim_mode_enabled: false,
+            vim_kill_switch_active: false,
         });
 
         pane.set_task_running(true);

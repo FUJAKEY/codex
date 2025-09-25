@@ -14,9 +14,64 @@ use textwrap::Options;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimState {
+    Insert,
+    Normal,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimPendingOperator {
+    Delete,
+    Change,
+    Yank,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+struct VimRecordedChange {
+    start: usize,
+    end: usize,
+    inserted: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimPendingFind {
+    ForwardInclusive,
+    ForwardExclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimFindDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VimFindState {
+    target: char,
+    direction: VimFindDirection,
+    stop_before: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimPendingTextObject {
+    Inner,
+    Around,
+}
+
 #[derive(Debug, Clone)]
 struct TextElement {
     range: Range<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct TextAreaSnapshot {
+    text: String,
+    cursor: usize,
+    elements: Vec<TextElement>,
+    preferred_col: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -26,6 +81,27 @@ pub(crate) struct TextArea {
     wrap_cache: RefCell<Option<WrapCache>>,
     preferred_col: Option<usize>,
     elements: Vec<TextElement>,
+    // Vim mode support
+    vim_mode_enabled: bool,
+    vim_state: VimState,
+    vim_pending_op: Option<VimPendingOperator>,
+    vim_input_count: Option<usize>,
+    vim_last_change: Option<VimRecordedChange>,
+    vim_pending_find: Option<VimPendingFind>,
+    vim_pending_g: bool,
+    vim_last_find: Option<VimFindState>,
+    vim_register: String,
+    undo_stack: Vec<TextAreaSnapshot>,
+    redo_stack: Vec<TextAreaSnapshot>,
+    suspend_undo: bool,
+    vim_pending_textobj: Option<VimPendingTextObject>,
+    vim_pending_replace: bool,
+    vim_last_command: Vec<KeyEvent>,
+    vim_current_command: Vec<KeyEvent>,
+    vim_recording_command: bool,
+    vim_replaying_dot: bool,
+    vim_pending_count_keys: Vec<KeyEvent>,
+    vim_last_unhandled: Option<KeyEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +117,7 @@ pub(crate) struct TextAreaState {
 }
 
 impl TextArea {
+    const UNDO_STACK_LIMIT: usize = 256;
     pub fn new() -> Self {
         Self {
             text: String::new(),
@@ -48,6 +125,26 @@ impl TextArea {
             wrap_cache: RefCell::new(None),
             preferred_col: None,
             elements: Vec::new(),
+            vim_mode_enabled: false,
+            vim_state: VimState::Insert,
+            vim_pending_op: None,
+            vim_input_count: None,
+            vim_last_change: None,
+            vim_pending_find: None,
+            vim_pending_g: false,
+            vim_last_find: None,
+            vim_register: String::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            suspend_undo: false,
+            vim_pending_textobj: None,
+            vim_pending_replace: false,
+            vim_last_command: Vec::new(),
+            vim_current_command: Vec::new(),
+            vim_recording_command: false,
+            vim_replaying_dot: false,
+            vim_pending_count_keys: Vec::new(),
+            vim_last_unhandled: None,
         }
     }
 
@@ -57,6 +154,15 @@ impl TextArea {
         self.wrap_cache.replace(None);
         self.preferred_col = None;
         self.elements.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.suspend_undo = false;
+        self.vim_pending_textobj = None;
+        self.vim_pending_replace = false;
+        self.vim_recording_command = false;
+        self.vim_pending_count_keys.clear();
+        self.vim_current_command.clear();
+        self.vim_last_unhandled = None;
     }
 
     pub fn text(&self) -> &str {
@@ -68,6 +174,7 @@ impl TextArea {
     }
 
     pub fn insert_str_at(&mut self, pos: usize, text: &str) {
+        self.push_undo_state();
         let pos = self.clamp_pos_for_insertion(pos);
         self.text.insert_str(pos, text);
         self.wrap_cache.replace(None);
@@ -89,6 +196,7 @@ impl TextArea {
         let end = range.end.clamp(0, self.text.len());
         let removed_len = end - start;
         let inserted_len = text.len();
+        self.push_undo_state();
         if removed_len == 0 && inserted_len == 0 {
             return;
         }
@@ -202,7 +310,1567 @@ impl TextArea {
         self.end_of_line(self.cursor_pos)
     }
 
+    fn vim_clear_count(&mut self) {
+        self.vim_input_count = None;
+    }
+
+    fn vim_take_count(&mut self) -> usize {
+        self.vim_input_count.take().unwrap_or(1).max(1)
+    }
+
+    fn vim_append_digit(&mut self, digit: u32) {
+        let base = self.vim_input_count.unwrap_or(0);
+        let next = base
+            .saturating_mul(10)
+            .saturating_add(digit as usize)
+            .max(1);
+        self.vim_input_count = Some(next);
+    }
+
+    fn mark_unhandled_vim_key(&mut self, event: KeyEvent) {
+        self.vim_last_unhandled = Some(event);
+    }
+
+    pub(crate) fn take_last_unhandled_vim_key(&mut self) -> Option<KeyEvent> {
+        self.vim_last_unhandled.take()
+    }
+
+    fn vim_total_lines(&self) -> usize {
+        if self.text.is_empty() {
+            1
+        } else {
+            self.text.chars().filter(|&c| c == '\n').count() + 1
+        }
+    }
+
+    fn vim_line_start_for(&self, line_idx: usize) -> usize {
+        if line_idx == 0 {
+            return 0;
+        }
+        let mut seen = 0usize;
+        for (i, c) in self.text.char_indices() {
+            if c == '\n' {
+                seen += 1;
+                if seen == line_idx {
+                    return (i + 1).min(self.text.len());
+                }
+            }
+        }
+        self.text.len()
+    }
+
+    fn vim_current_line_index(&self) -> usize {
+        self.text[..self.cursor_pos]
+            .chars()
+            .filter(|&c| c == '\n')
+            .count()
+    }
+
+    fn vim_move_cursor_to_line(&mut self, line_idx: usize, first_non_blank: bool) {
+        let total_lines = self.vim_total_lines();
+        if total_lines == 0 {
+            self.set_cursor(0);
+            return;
+        }
+        let clamped = line_idx.min(total_lines.saturating_sub(1));
+        let start = self.vim_line_start_for(clamped);
+        let end = self.end_of_line(start);
+        let target = if first_non_blank {
+            self.vim_first_non_blank(start, end)
+        } else {
+            start
+        };
+        self.set_cursor(target);
+    }
+
+    fn vim_first_non_blank(&self, start: usize, end: usize) -> usize {
+        for (idx, ch) in self.text[start..end].char_indices() {
+            if !ch.is_whitespace() {
+                return start + idx;
+            }
+        }
+        start
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn is_word_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || ch == '_'
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn clamp_to_char_boundary(&self, pos: usize) -> usize {
+        if pos >= self.text.len() {
+            return self.text.len();
+        }
+        if self.text.is_char_boundary(pos) {
+            pos
+        } else {
+            self.prev_atomic_boundary(pos)
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn expand_word_at(&self, start: usize) -> (usize, usize) {
+        let mut start = start;
+        while start > 0 {
+            let prev = self.prev_atomic_boundary(start);
+            if let Some(ch) = self.text[prev..].chars().next()
+                && Self::is_word_char(ch)
+            {
+                start = prev;
+                continue;
+            }
+            break;
+        }
+        let mut end = self.next_atomic_boundary(start);
+        while end < self.text.len() {
+            if let Some(ch) = self.text[end..].chars().next()
+                && Self::is_word_char(ch)
+            {
+                end = self.next_atomic_boundary(end);
+                continue;
+            }
+            break;
+        }
+        (
+            self.adjust_pos_out_of_elements(start, true),
+            self.adjust_pos_out_of_elements(end, false),
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn find_word_region(&self, pos: usize) -> Option<(usize, usize)> {
+        if self.text.is_empty() {
+            return None;
+        }
+        let len = self.text.len();
+        let mut pos = pos.min(len);
+        pos = self.clamp_to_char_boundary(pos);
+
+        if pos < len
+            && let Some(ch) = self.text[pos..].chars().next()
+            && Self::is_word_char(ch)
+        {
+            return Some(self.expand_word_at(pos));
+        }
+
+        if pos > 0 {
+            let prev = self.prev_atomic_boundary(pos);
+            if let Some(ch) = self.text[prev..].chars().next()
+                && Self::is_word_char(ch)
+            {
+                return Some(self.expand_word_at(prev));
+            }
+        }
+
+        let mut iter = pos;
+        while iter < len {
+            iter = self.next_atomic_boundary(iter);
+            if iter >= len {
+                break;
+            }
+            if let Some(ch) = self.text[iter..].chars().next()
+                && Self::is_word_char(ch)
+            {
+                return Some(self.expand_word_at(iter));
+            }
+        }
+        None
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn vim_inner_word_range(&self) -> Option<(usize, usize)> {
+        let (start, end) = self.find_word_region(self.cursor_pos)?;
+        if start == end {
+            None
+        } else {
+            Some((start, end))
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn vim_around_word_range(&self) -> Option<(usize, usize)> {
+        let (start, inner_end) = self.vim_inner_word_range()?;
+        let mut cursor = inner_end;
+        let mut end = inner_end;
+        while cursor < self.text.len() {
+            let ch = self.text[cursor..].chars().next().unwrap();
+            if ch == ' ' || ch == '\t' {
+                cursor = self.next_atomic_boundary(cursor);
+                end = cursor;
+            } else {
+                break;
+            }
+        }
+        Some((start, end))
+    }
+
+    fn vim_enter_insert_mode(&mut self) {
+        self.vim_state = VimState::Insert;
+        self.vim_pending_op = None;
+        self.vim_pending_find = None;
+        self.vim_pending_g = false;
+        self.vim_pending_textobj = None;
+        self.vim_pending_replace = false;
+        self.vim_clear_count();
+    }
+
+    fn begin_vim_command(&mut self, event: KeyEvent) {
+        if self.vim_replaying_dot {
+            return;
+        }
+        if !self.vim_recording_command {
+            self.vim_recording_command = true;
+            self.vim_current_command.clear();
+            if !self.vim_pending_count_keys.is_empty() {
+                self.vim_current_command
+                    .extend(self.vim_pending_count_keys.iter().copied());
+                self.vim_pending_count_keys.clear();
+            }
+        }
+        self.vim_current_command.push(event);
+    }
+
+    fn push_vim_command_event(&mut self, event: KeyEvent) {
+        if self.vim_replaying_dot {
+            return;
+        }
+        if self.vim_recording_command {
+            self.vim_current_command.push(event);
+        }
+    }
+
+    fn finish_vim_command(&mut self) {
+        if self.vim_replaying_dot {
+            return;
+        }
+        if self.vim_recording_command {
+            if !self.vim_current_command.is_empty() {
+                self.vim_last_command = self.vim_current_command.clone();
+            }
+            self.vim_recording_command = false;
+            self.vim_current_command.clear();
+            self.vim_pending_count_keys.clear();
+        }
+    }
+
+    fn abort_vim_command(&mut self) {
+        if self.vim_replaying_dot {
+            return;
+        }
+        self.vim_recording_command = false;
+        self.vim_current_command.clear();
+        self.vim_pending_count_keys.clear();
+    }
+
+    fn record_count_key(&mut self, event: KeyEvent) {
+        if self.vim_replaying_dot {
+            return;
+        }
+        if self.vim_recording_command {
+            self.vim_current_command.push(event);
+        } else {
+            self.vim_pending_count_keys.push(event);
+        }
+    }
+
+    fn replay_last_command(&mut self) {
+        if self.vim_last_command.is_empty() {
+            return;
+        }
+        self.vim_replaying_dot = true;
+        let cmds = self.vim_last_command.clone();
+        for evt in cmds {
+            self.input(evt);
+        }
+        self.vim_replaying_dot = false;
+    }
+
+    fn vim_store_range(&mut self, start: usize, end: usize) {
+        if end <= start || start >= self.text.len() {
+            return;
+        }
+        let end = end.min(self.text.len());
+        self.vim_register = self.text[start..end].to_string();
+    }
+
+    fn snapshot(&self) -> TextAreaSnapshot {
+        TextAreaSnapshot {
+            text: self.text.clone(),
+            cursor: self.cursor_pos,
+            elements: self.elements.clone(),
+            preferred_col: self.preferred_col,
+        }
+    }
+
+    fn push_undo_state(&mut self) {
+        if self.suspend_undo {
+            return;
+        }
+        let snapshot = self.snapshot();
+        if self
+            .undo_stack
+            .last()
+            .is_some_and(|last| last.text == snapshot.text && last.cursor == snapshot.cursor)
+        {
+            return;
+        }
+        if self.undo_stack.len() >= Self::UNDO_STACK_LIMIT {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(snapshot);
+        self.redo_stack.clear();
+    }
+
+    fn apply_snapshot(&mut self, snapshot: TextAreaSnapshot) {
+        self.suspend_undo = true;
+        self.text = snapshot.text;
+        self.cursor_pos = snapshot.cursor.min(self.text.len());
+        self.elements = snapshot.elements;
+        self.preferred_col = snapshot.preferred_col;
+        self.wrap_cache.replace(None);
+        self.suspend_undo = false;
+        self.vim_state = VimState::Normal;
+        self.vim_pending_op = None;
+        self.vim_pending_find = None;
+        self.vim_pending_g = false;
+        self.vim_pending_textobj = None;
+        self.vim_clear_count();
+    }
+
+    fn vim_undo(&mut self) {
+        if let Some(snapshot) = self.undo_stack.pop() {
+            let current = self.snapshot();
+            if self.redo_stack.len() >= Self::UNDO_STACK_LIMIT {
+                self.redo_stack.remove(0);
+            }
+            self.redo_stack.push(current);
+            self.apply_snapshot(snapshot);
+        }
+    }
+
+    fn vim_redo(&mut self) {
+        if let Some(snapshot) = self.redo_stack.pop() {
+            let current = self.snapshot();
+            if self.undo_stack.len() >= Self::UNDO_STACK_LIMIT {
+                self.undo_stack.remove(0);
+            }
+            self.undo_stack.push(current);
+            self.apply_snapshot(snapshot);
+        }
+    }
+
+    fn vim_change_forward_to(&mut self, end: usize) {
+        self.vim_delete_forward_to(end);
+        self.vim_enter_insert_mode();
+    }
+
+    fn vim_change_current_line(&mut self, count: usize) {
+        let count = count.max(1);
+        let start = self.beginning_of_current_line();
+        let mut cursor = start;
+        let mut end = start;
+        for _ in 0..count {
+            let line_end = self.end_of_line(cursor);
+            end = line_end;
+            if end < self.text.len() {
+                end += 1;
+            }
+            cursor = end;
+        }
+        end = end.min(self.text.len());
+        self.vim_store_range(start, end);
+        self.replace_range(start..end, "");
+        self.insert_str_at(start, "\n");
+        self.set_cursor(start);
+        self.vim_enter_insert_mode();
+    }
+
+    fn vim_yank_lines(&mut self, count: usize) {
+        let count = count.max(1);
+        let start = self.beginning_of_current_line();
+        let mut cursor = start;
+        let mut end = start;
+        for _ in 0..count {
+            let line_end = self.end_of_line(cursor);
+            end = line_end;
+            if end < self.text.len() {
+                end += 1;
+            }
+            cursor = end;
+        }
+        end = end.min(self.text.len());
+        self.vim_store_range(start, end);
+        self.set_cursor(start);
+    }
+
+    fn vim_replace_with_char(&mut self, ch: char) {
+        let count = self.vim_take_count().max(1);
+        let start = self.cursor_pos;
+        let mut end = start;
+        for _ in 0..count {
+            let next = self.next_atomic_boundary(end);
+            if next == end {
+                break;
+            }
+            end = next;
+        }
+        if end <= start {
+            return;
+        }
+        let inserted = ch.to_string().repeat(count);
+        self.replace_range(start..end, &inserted);
+        let char_len = ch.len_utf8();
+        let new_cursor = start + char_len.saturating_mul(count.saturating_sub(1));
+        self.set_cursor(new_cursor);
+        self.vim_last_change = Some(VimRecordedChange {
+            start,
+            end: start + inserted.len(),
+            inserted,
+        });
+    }
+
+    #[allow(dead_code)]
+    fn replay_last_change(&mut self) {
+        if let Some(change) = self.vim_last_change.clone() {
+            let VimRecordedChange {
+                start,
+                end,
+                inserted,
+            } = change;
+            let end = end.min(self.text.len());
+            self.replace_range(start..end, &inserted);
+            self.set_cursor(start + inserted.len());
+        }
+    }
+
+    fn char_len_at(&self, pos: usize) -> usize {
+        self.text[pos..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(0)
+    }
+
+    fn vim_find_forward_match(&self, from: usize, target: char, count: usize) -> Option<usize> {
+        let line_end = self.end_of_line(from);
+        if from >= line_end {
+            return None;
+        }
+        let slice = &self.text[from..line_end];
+        let mut remaining = count;
+        for (offset, ch) in slice.char_indices() {
+            if ch == target {
+                remaining = remaining.saturating_sub(1);
+                if remaining == 0 {
+                    return Some(from + offset);
+                }
+            }
+        }
+        None
+    }
+
+    fn vim_find_backward_match(&self, from: usize, target: char, count: usize) -> Option<usize> {
+        let line_start = self.beginning_of_line(from);
+        if from <= line_start {
+            return None;
+        }
+        let mut remaining = count;
+        let mut pos = self.prev_atomic_boundary(from);
+        while pos >= line_start {
+            if let Some(ch) = self.text[pos..].chars().next()
+                && ch == target
+            {
+                remaining = remaining.saturating_sub(1);
+                if remaining == 0 {
+                    return Some(pos);
+                }
+            }
+            if pos == line_start {
+                break;
+            }
+            let next_pos = self.prev_atomic_boundary(pos);
+            if next_pos == pos {
+                break;
+            }
+            pos = next_pos;
+        }
+        None
+    }
+
+    fn vim_perform_find(
+        &mut self,
+        target: char,
+        direction: VimFindDirection,
+        stop_before: bool,
+        count: usize,
+    ) -> bool {
+        let count = count.max(1);
+        let result = match direction {
+            VimFindDirection::Forward => {
+                let start = self.next_atomic_boundary(self.cursor_pos);
+                self.vim_find_forward_match(start, target, count)
+            }
+            VimFindDirection::Backward => {
+                self.vim_find_backward_match(self.cursor_pos, target, count)
+            }
+        };
+
+        let Some(found) = result else {
+            if self.vim_pending_op.is_some() {
+                self.vim_pending_op = None;
+                self.abort_vim_command();
+            }
+            return false;
+        };
+
+        let char_len = self.char_len_at(found);
+        let dest = match (direction, stop_before) {
+            (VimFindDirection::Forward, false) => found,
+            (VimFindDirection::Forward, true) => {
+                let prev = self.prev_atomic_boundary(found);
+                if prev == found {
+                    return false;
+                }
+                prev
+            }
+            (VimFindDirection::Backward, false) => found,
+            (VimFindDirection::Backward, true) => {
+                let after = self.next_atomic_boundary(found + char_len);
+                after.min(self.text.len())
+            }
+        };
+
+        if let Some(op) = self.vim_pending_op.take() {
+            match op {
+                VimPendingOperator::Delete => {
+                    let delete_end = match direction {
+                        VimFindDirection::Forward => {
+                            if stop_before {
+                                self.next_atomic_boundary(dest)
+                            } else {
+                                self.next_atomic_boundary(found + char_len)
+                            }
+                        }
+                        VimFindDirection::Backward => {
+                            // Deleting backwards is not yet supported; bail out and restore state.
+                            self.vim_pending_op = Some(VimPendingOperator::Delete);
+                            return false;
+                        }
+                    };
+                    if delete_end <= self.cursor_pos {
+                        return false;
+                    }
+                    self.vim_delete_forward_to(delete_end);
+                }
+                VimPendingOperator::Change => {
+                    let delete_end = match direction {
+                        VimFindDirection::Forward => {
+                            if stop_before {
+                                self.next_atomic_boundary(dest)
+                            } else {
+                                self.next_atomic_boundary(found + char_len)
+                            }
+                        }
+                        VimFindDirection::Backward => {
+                            self.vim_pending_op = Some(VimPendingOperator::Change);
+                            return false;
+                        }
+                    };
+                    if delete_end <= self.cursor_pos {
+                        return false;
+                    }
+                    self.vim_change_forward_to(delete_end);
+                }
+                VimPendingOperator::Yank => {
+                    self.vim_pending_op = Some(VimPendingOperator::Yank);
+                    self.vim_clear_count();
+                    return false;
+                }
+            }
+            // Operator motions leave cursor at the beginning (already true).
+        } else {
+            self.set_cursor(dest);
+        }
+
+        self.vim_last_find = Some(VimFindState {
+            target,
+            direction,
+            stop_before,
+        });
+        true
+    }
+
+    fn vim_register_is_linewise(&self) -> bool {
+        self.vim_register.contains('\n')
+    }
+
+    fn vim_put_after(&mut self, count: usize) {
+        if self.vim_register.is_empty() {
+            return;
+        }
+        let times = count.max(1);
+        let insertion = self.vim_register.repeat(times);
+        if self.vim_register_is_linewise() {
+            let end = self.end_of_current_line();
+            let insert_pos = if end < self.text.len() {
+                end + 1
+            } else {
+                self.text.len()
+            };
+            self.insert_str_at(insert_pos, &insertion);
+            self.set_cursor(insert_pos);
+        } else {
+            let mut pos = self.next_atomic_boundary(self.cursor_pos);
+            self.insert_str_at(pos, &insertion);
+            pos += insertion.len();
+            self.set_cursor(pos);
+        }
+    }
+
+    fn vim_put_before(&mut self, count: usize) {
+        if self.vim_register.is_empty() {
+            return;
+        }
+        let times = count.max(1);
+        let insertion = self.vim_register.repeat(times);
+        if self.vim_register_is_linewise() {
+            let insert_pos = self.beginning_of_current_line();
+            self.insert_str_at(insert_pos, &insertion);
+            self.set_cursor(insert_pos);
+        } else {
+            let pos = self.cursor_pos;
+            self.insert_str_at(pos, &insertion);
+            self.set_cursor(pos + insertion.len());
+        }
+    }
+
     pub fn input(&mut self, event: KeyEvent) {
+        self.vim_last_unhandled = None;
+        // Handle Vim mode state machine first. When enabled and in Normal mode,
+        // we consume most keystrokes here and return early.
+        if self.vim_mode_enabled {
+            // ESC (or Ctrl+[) always returns to Normal from either state.
+            match event {
+                KeyEvent {
+                    code: KeyCode::Esc, ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Char('['),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    if matches!(self.vim_state, VimState::Insert) {
+                        if self.vim_recording_command {
+                            self.push_vim_command_event(event);
+                            self.finish_vim_command();
+                        }
+                    } else if self.vim_recording_command {
+                        self.abort_vim_command();
+                    }
+                    self.vim_state = VimState::Normal;
+                    self.preferred_col = None;
+                    self.vim_pending_op = None;
+                    self.vim_input_count = None;
+                    self.vim_pending_find = None;
+                    self.vim_pending_g = false;
+                    self.vim_pending_textobj = None;
+                    self.vim_pending_replace = false;
+                    return;
+                }
+                _ => {}
+            }
+
+            match self.vim_state {
+                VimState::Normal => {
+                    if let Some(obj) = self.vim_pending_textobj.take() {
+                        if self.vim_recording_command {
+                            self.push_vim_command_event(event);
+                        }
+                        if let KeyEvent {
+                            code: KeyCode::Char('w'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } = event
+                        {
+                            let range = match obj {
+                                VimPendingTextObject::Inner => self.vim_inner_word_range(),
+                                VimPendingTextObject::Around => self.vim_around_word_range(),
+                            };
+                            if let Some((start, end)) = range {
+                                match self.vim_pending_op.take() {
+                                    Some(VimPendingOperator::Delete) => {
+                                        self.vim_store_range(start, end);
+                                        self.replace_range(start..end, "");
+                                        self.set_cursor(start);
+                                        self.finish_vim_command();
+                                    }
+                                    Some(VimPendingOperator::Change) => {
+                                        self.vim_store_range(start, end);
+                                        self.replace_range(start..end, "");
+                                        self.set_cursor(start);
+                                        self.vim_enter_insert_mode();
+                                    }
+                                    Some(VimPendingOperator::Yank) => {
+                                        self.vim_store_range(start, end);
+                                        self.vim_pending_op = None;
+                                    }
+                                    None => {}
+                                }
+                            }
+                            return;
+                        }
+                        self.vim_pending_textobj = None;
+                        self.mark_unhandled_vim_key(event);
+                        return;
+                    }
+
+                    if self.vim_pending_replace {
+                        if self.vim_recording_command {
+                            self.push_vim_command_event(event);
+                        }
+                        self.vim_pending_replace = false;
+                        match event {
+                            KeyEvent {
+                                code: KeyCode::Char(ch),
+                                modifiers,
+                                ..
+                            } if !modifiers.contains(KeyModifiers::CONTROL)
+                                && !modifiers.contains(KeyModifiers::ALT) =>
+                            {
+                                self.vim_replace_with_char(ch);
+                                self.finish_vim_command();
+                                return;
+                            }
+                            KeyEvent {
+                                code: KeyCode::Enter,
+                                ..
+                            } => {
+                                self.vim_replace_with_char('\n');
+                                self.finish_vim_command();
+                                return;
+                            }
+                            _ => {
+                                self.mark_unhandled_vim_key(event);
+                                self.abort_vim_command();
+                                self.vim_pending_op = None;
+                                self.vim_clear_count();
+                                return;
+                            }
+                        }
+                    }
+
+                    if let Some(pending) = self.vim_pending_find {
+                        match event {
+                            KeyEvent {
+                                code: KeyCode::Char(ch),
+                                modifiers,
+                                ..
+                            } => {
+                                if !(modifiers.contains(KeyModifiers::CONTROL)
+                                    || modifiers.contains(KeyModifiers::ALT))
+                                {
+                                    self.vim_pending_find = None;
+                                    let stop_before =
+                                        matches!(pending, VimPendingFind::ForwardExclusive);
+                                    let count = self.vim_take_count();
+                                    let success = self.vim_perform_find(
+                                        ch,
+                                        VimFindDirection::Forward,
+                                        stop_before,
+                                        count,
+                                    );
+                                    if !success {
+                                        self.vim_clear_count();
+                                    }
+                                    return;
+                                }
+                            }
+                            _ => {
+                                self.vim_pending_find = None;
+                                self.mark_unhandled_vim_key(event);
+                                return;
+                            }
+                        }
+                        self.vim_pending_find = None;
+                    }
+
+                    if self.vim_pending_g {
+                        self.vim_pending_g = false;
+                        if let KeyEvent {
+                            code: KeyCode::Char('g'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } = event
+                        {
+                            let count = self.vim_take_count();
+                            let target_line = count.saturating_sub(1);
+                            self.vim_move_cursor_to_line(target_line, true);
+                            return;
+                        }
+                    }
+
+                    match event {
+                        KeyEvent {
+                            code: KeyCode::Char('u'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } => {
+                            self.abort_vim_command();
+                            self.vim_pending_op = None;
+                            self.vim_pending_textobj = None;
+                            self.vim_pending_find = None;
+                            self.vim_pending_replace = false;
+                            self.vim_undo();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('r'),
+                            modifiers,
+                            ..
+                        } if modifiers == KeyModifiers::CONTROL => {
+                            self.abort_vim_command();
+                            self.vim_pending_op = None;
+                            self.vim_pending_textobj = None;
+                            self.vim_pending_find = None;
+                            self.vim_pending_replace = false;
+                            self.vim_redo();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('r'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } => {
+                            if self.vim_recording_command && !self.vim_pending_replace {
+                                self.abort_vim_command();
+                            }
+                            self.begin_vim_command(event);
+                            self.vim_pending_op = None;
+                            self.vim_pending_textobj = None;
+                            self.vim_pending_replace = true;
+                            return;
+                        }
+
+                        KeyEvent {
+                            code: KeyCode::Char('.'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } => {
+                            if self.vim_recording_command {
+                                self.abort_vim_command();
+                            }
+                            self.vim_pending_op = None;
+                            self.vim_pending_textobj = None;
+                            self.vim_pending_find = None;
+                            self.vim_pending_replace = false;
+                            let count = self.vim_take_count();
+                            for _ in 0..count {
+                                self.replay_last_command();
+                            }
+                            return;
+                        }
+
+                        KeyEvent {
+                            code: KeyCode::Char(ch @ '1'..='9'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } => {
+                            self.record_count_key(event);
+                            self.vim_append_digit(ch.to_digit(10).unwrap());
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('0'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if self.vim_input_count.is_some() || self.vim_pending_op.is_some() => {
+                            self.record_count_key(event);
+                            self.vim_append_digit(0);
+                            return;
+                        }
+                        // Motions that can complete an operator or move the cursor.
+                        KeyEvent {
+                            code: KeyCode::Char('w'),
+                            ..
+                        } => {
+                            if let Some(op) = self.vim_pending_op {
+                                if self.vim_recording_command {
+                                    self.push_vim_command_event(event);
+                                }
+                                let count = self.vim_take_count();
+                                match op {
+                                    VimPendingOperator::Delete => {
+                                        for _ in 0..count {
+                                            let end = self.beginning_of_next_word();
+                                            self.vim_delete_forward_to(end);
+                                        }
+                                        self.vim_pending_op = None;
+                                        self.finish_vim_command();
+                                    }
+                                    VimPendingOperator::Change => {
+                                        let orig = self.cursor_pos;
+                                        let mut end = orig;
+                                        for _ in 0..count {
+                                            self.cursor_pos = end;
+                                            end = self.beginning_of_next_word();
+                                        }
+                                        self.cursor_pos = orig;
+                                        self.vim_change_forward_to(end);
+                                    }
+                                    VimPendingOperator::Yank => {
+                                        let orig = self.cursor_pos;
+                                        let mut end = orig;
+                                        for _ in 0..count {
+                                            self.cursor_pos = end;
+                                            end = self.beginning_of_next_word();
+                                        }
+                                        self.cursor_pos = orig;
+                                        self.vim_store_range(orig, end);
+                                        self.vim_pending_op = None;
+                                    }
+                                }
+                                return;
+                            }
+                            let count = self.vim_take_count();
+                            for _ in 0..count {
+                                let p = self.beginning_of_next_word();
+                                self.set_cursor(p);
+                            }
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('e'),
+                            ..
+                        } => {
+                            if let Some(op) = self.vim_pending_op {
+                                if self.vim_recording_command {
+                                    self.push_vim_command_event(event);
+                                }
+                                let count = self.vim_take_count();
+                                match op {
+                                    VimPendingOperator::Delete => {
+                                        for _ in 0..count {
+                                            let end = self.end_of_next_word();
+                                            self.vim_delete_forward_to(end);
+                                        }
+                                        self.vim_pending_op = None;
+                                        self.finish_vim_command();
+                                    }
+                                    VimPendingOperator::Change => {
+                                        let orig = self.cursor_pos;
+                                        let mut end = orig;
+                                        for _ in 0..count {
+                                            self.cursor_pos = end;
+                                            end = self.end_of_next_word();
+                                        }
+                                        self.cursor_pos = orig;
+                                        self.vim_change_forward_to(end);
+                                    }
+                                    VimPendingOperator::Yank => {
+                                        let orig = self.cursor_pos;
+                                        let mut end = orig;
+                                        for _ in 0..count {
+                                            self.cursor_pos = end;
+                                            end = self.end_of_next_word();
+                                        }
+                                        self.cursor_pos = orig;
+                                        self.vim_store_range(orig, end);
+                                        self.vim_pending_op = None;
+                                    }
+                                }
+                                return;
+                            }
+                            let count = self.vim_take_count();
+                            for _ in 0..count {
+                                let p = self.end_of_next_word();
+                                self.set_cursor(p);
+                            }
+                            return;
+                        }
+                        // Pending operators
+                        KeyEvent {
+                            code: KeyCode::Char('d'),
+                            ..
+                        } => {
+                            if self.vim_recording_command
+                                && !matches!(self.vim_pending_op, Some(VimPendingOperator::Delete))
+                            {
+                                self.abort_vim_command();
+                            }
+                            self.begin_vim_command(event);
+                            // If already pending delete, 'dd' deletes current line.
+                            if matches!(self.vim_pending_op, Some(VimPendingOperator::Delete)) {
+                                let count = self.vim_take_count();
+                                for _ in 0..count {
+                                    self.vim_delete_current_line();
+                                }
+                                self.vim_pending_op = None;
+                                self.finish_vim_command();
+                            } else {
+                                self.vim_pending_op = Some(VimPendingOperator::Delete);
+                            }
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('c'),
+                            ..
+                        } => {
+                            if self.vim_recording_command
+                                && !matches!(self.vim_pending_op, Some(VimPendingOperator::Change))
+                            {
+                                self.abort_vim_command();
+                            }
+                            self.begin_vim_command(event);
+                            if matches!(self.vim_pending_op, Some(VimPendingOperator::Change)) {
+                                let count = self.vim_take_count();
+                                self.vim_change_current_line(count);
+                            } else {
+                                self.vim_pending_op = Some(VimPendingOperator::Change);
+                            }
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('y'),
+                            ..
+                        } => {
+                            if matches!(self.vim_pending_op, Some(VimPendingOperator::Yank)) {
+                                let count = self.vim_take_count();
+                                self.vim_yank_lines(count);
+                                self.vim_pending_op = None;
+                                return;
+                            }
+                            self.vim_pending_op = Some(VimPendingOperator::Yank);
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('Y'),
+                            ..
+                        } => {
+                            let count = self.vim_take_count();
+                            self.vim_yank_lines(count);
+                            self.vim_pending_op = None;
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('C'),
+                            ..
+                        } => {
+                            let count = self.vim_take_count();
+                            let count = count.max(1);
+                            for i in 0..count {
+                                self.kill_to_end_of_line();
+                                if i + 1 < count
+                                    && self.cursor_pos < self.text.len()
+                                    && self.text.as_bytes()[self.cursor_pos] == b'\n'
+                                {
+                                    self.delete_forward(1);
+                                }
+                            }
+                            self.vim_enter_insert_mode();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('g'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } => {
+                            if self.vim_pending_op.is_some() {
+                                self.vim_pending_op = None;
+                                self.vim_clear_count();
+                                return;
+                            }
+                            self.vim_pending_g = true;
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('G'),
+                            ..
+                        } => {
+                            let total_lines = self.vim_total_lines();
+                            if total_lines == 0 {
+                                self.set_cursor(0);
+                                return;
+                            }
+                            if let Some(op) = self.vim_pending_op {
+                                let count = self.vim_take_count();
+                                match op {
+                                    VimPendingOperator::Delete => {
+                                        let target = if count > 1 {
+                                            count.saturating_sub(1).min(total_lines - 1)
+                                        } else {
+                                            total_lines - 1
+                                        };
+                                        let end_line_start = self.vim_line_start_for(target);
+                                        let mut end = self.end_of_line(end_line_start);
+                                        if end < self.text.len() {
+                                            end += 1;
+                                        }
+                                        self.vim_delete_forward_to(end);
+                                        self.vim_pending_op = None;
+                                    }
+                                    VimPendingOperator::Change => {
+                                        let target = if count > 1 {
+                                            count.saturating_sub(1).min(total_lines - 1)
+                                        } else {
+                                            total_lines - 1
+                                        };
+                                        let end_line_start = self.vim_line_start_for(target);
+                                        let mut end = self.end_of_line(end_line_start);
+                                        if end < self.text.len() {
+                                            end += 1;
+                                        }
+                                        self.vim_change_forward_to(end);
+                                    }
+                                    VimPendingOperator::Yank => {
+                                        let target = if count > 1 {
+                                            count.saturating_sub(1).min(total_lines - 1)
+                                        } else {
+                                            total_lines - 1
+                                        };
+                                        let start = self.beginning_of_current_line();
+                                        let end_line_start = self.vim_line_start_for(target);
+                                        let mut end = self.end_of_line(end_line_start);
+                                        if end < self.text.len() {
+                                            end += 1;
+                                        }
+                                        self.vim_store_range(start, end);
+                                        self.vim_pending_op = None;
+                                    }
+                                }
+                                return;
+                            }
+                            let count = self.vim_take_count();
+                            let target = if count > 1 {
+                                count.saturating_sub(1).min(total_lines - 1)
+                            } else {
+                                total_lines - 1
+                            };
+                            self.vim_move_cursor_to_line(target, true);
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('^'),
+                            ..
+                        } => {
+                            let line_idx = self.vim_current_line_index();
+                            self.vim_move_cursor_to_line(line_idx, true);
+                            self.vim_clear_count();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('f'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } => {
+                            self.vim_pending_find = Some(VimPendingFind::ForwardInclusive);
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('t'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } => {
+                            self.vim_pending_find = Some(VimPendingFind::ForwardExclusive);
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char(';'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } => {
+                            let Some(state) = self.vim_last_find else {
+                                self.vim_clear_count();
+                                return;
+                            };
+                            let count = self.vim_take_count();
+                            if !self.vim_perform_find(
+                                state.target,
+                                state.direction,
+                                state.stop_before,
+                                count,
+                            ) {
+                                self.vim_clear_count();
+                            }
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char(','),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } => {
+                            let Some(state) = self.vim_last_find else {
+                                self.vim_clear_count();
+                                return;
+                            };
+                            let direction = match state.direction {
+                                VimFindDirection::Forward => VimFindDirection::Backward,
+                                VimFindDirection::Backward => VimFindDirection::Forward,
+                            };
+                            let count = self.vim_take_count();
+                            if !self.vim_perform_find(
+                                state.target,
+                                direction,
+                                state.stop_before,
+                                count,
+                            ) {
+                                self.vim_clear_count();
+                            }
+                            return;
+                        }
+                        // Enter Insert mode
+                        KeyEvent {
+                            code: KeyCode::Char('i'),
+                            ..
+                        } => {
+                            if self.vim_pending_op.is_some() {
+                                if self.vim_recording_command {
+                                    self.push_vim_command_event(event);
+                                }
+                                self.vim_pending_textobj = Some(VimPendingTextObject::Inner);
+                                return;
+                            }
+                            self.vim_enter_insert_mode();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('I'),
+                            ..
+                        } => {
+                            self.move_cursor_to_beginning_of_line(false);
+                            self.vim_enter_insert_mode();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('a'),
+                            ..
+                        } => {
+                            if self.vim_pending_op.is_some() {
+                                if self.vim_recording_command {
+                                    self.push_vim_command_event(event);
+                                }
+                                self.vim_pending_textobj = Some(VimPendingTextObject::Around);
+                                return;
+                            }
+                            let count = self.vim_take_count();
+                            for _ in 0..count {
+                                self.move_cursor_right();
+                            }
+                            self.vim_enter_insert_mode();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('A'),
+                            ..
+                        } => {
+                            self.move_cursor_to_end_of_line(false);
+                            self.vim_enter_insert_mode();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('o'),
+                            ..
+                        } => {
+                            if self.vim_recording_command {
+                                self.abort_vim_command();
+                            }
+                            self.begin_vim_command(event);
+                            // newline below current line
+                            let eol = self.end_of_current_line();
+                            self.set_cursor(eol);
+                            self.insert_str("\n");
+                            self.vim_enter_insert_mode();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('O'),
+                            ..
+                        } => {
+                            if self.vim_recording_command {
+                                self.abort_vim_command();
+                            }
+                            self.begin_vim_command(event);
+                            // newline above current line
+                            let bol = self.beginning_of_current_line();
+                            self.set_cursor(bol);
+                            self.insert_str("\n");
+                            self.set_cursor(bol);
+                            self.vim_enter_insert_mode();
+                            return;
+                        }
+
+                        // Movement
+                        KeyEvent {
+                            code: KeyCode::Char('h'),
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Left,
+                            ..
+                        } => {
+                            let count = self.vim_take_count();
+                            for _ in 0..count {
+                                self.move_cursor_left();
+                            }
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('l'),
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Right,
+                            ..
+                        } => {
+                            let count = self.vim_take_count();
+                            for _ in 0..count {
+                                self.move_cursor_right();
+                            }
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('k'),
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Up, ..
+                        } => {
+                            let count = self.vim_take_count();
+                            for _ in 0..count {
+                                self.move_cursor_up();
+                            }
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('j'),
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Down,
+                            ..
+                        } => {
+                            let count = self.vim_take_count();
+                            for _ in 0..count {
+                                self.move_cursor_down();
+                            }
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('0'),
+                            ..
+                        } => {
+                            if let Some(op) = self.vim_pending_op.take() {
+                                let count = self.vim_take_count();
+                                let start = self.beginning_of_current_line();
+                                let mut target = self.cursor_pos;
+                                for _ in 0..count.max(1) {
+                                    target = self.prev_atomic_boundary(target);
+                                    if target == start {
+                                        break;
+                                    }
+                                }
+                                let range_start = target.min(self.cursor_pos);
+                                match op {
+                                    VimPendingOperator::Delete => {
+                                        self.vim_store_range(range_start, self.cursor_pos);
+                                        self.replace_range(range_start..self.cursor_pos, "");
+                                        self.set_cursor(range_start);
+                                        self.vim_pending_op = None;
+                                        self.vim_clear_count();
+                                    }
+                                    VimPendingOperator::Change => {
+                                        self.vim_store_range(range_start, self.cursor_pos);
+                                        self.replace_range(range_start..self.cursor_pos, "");
+                                        self.set_cursor(range_start);
+                                        self.vim_enter_insert_mode();
+                                    }
+                                    VimPendingOperator::Yank => {
+                                        self.vim_store_range(range_start, self.cursor_pos);
+                                        self.vim_clear_count();
+                                        self.vim_pending_op = None;
+                                        return;
+                                    }
+                                }
+                                return;
+                            }
+                            self.move_cursor_to_beginning_of_line(false);
+                            self.vim_clear_count();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('$'),
+                            ..
+                        } => {
+                            if let Some(op) = self.vim_pending_op {
+                                let count = self.vim_take_count();
+                                match op {
+                                    VimPendingOperator::Delete => {
+                                        for _ in 0..count.max(1) {
+                                            self.kill_to_end_of_line();
+                                            if self.cursor_pos < self.text.len()
+                                                && self.text.as_bytes()[self.cursor_pos] == b'\n'
+                                            {
+                                                self.delete_forward(1);
+                                            }
+                                        }
+                                        self.vim_pending_op = None;
+                                    }
+                                    VimPendingOperator::Change => {
+                                        let end = self.end_of_current_line();
+                                        self.vim_change_forward_to(end);
+                                    }
+                                    VimPendingOperator::Yank => {
+                                        self.vim_pending_op = Some(VimPendingOperator::Yank);
+                                        self.vim_clear_count();
+                                        return;
+                                    }
+                                }
+                                return;
+                            }
+                            self.move_cursor_to_end_of_line(false);
+                            self.vim_clear_count();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('b'),
+                            ..
+                        } => {
+                            let count = self.vim_take_count();
+                            for _ in 0..count {
+                                let p = self.beginning_of_previous_word();
+                                self.set_cursor(p);
+                            }
+                            return;
+                        }
+                        // Edits
+                        KeyEvent {
+                            code: KeyCode::Char('x'),
+                            ..
+                        } => {
+                            if self.vim_recording_command {
+                                self.abort_vim_command();
+                            }
+                            self.begin_vim_command(event);
+                            if self.vim_pending_op.is_some() {
+                                self.vim_pending_op = None;
+                            }
+                            let count = self.vim_take_count();
+                            let start = self.cursor_pos;
+                            let mut end = start;
+                            for _ in 0..count {
+                                end = self.next_atomic_boundary(end);
+                                if end >= self.text.len() {
+                                    break;
+                                }
+                            }
+                            self.vim_store_range(start, end);
+                            self.delete_forward(count);
+                            self.finish_vim_command();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('X'),
+                            ..
+                        } => {
+                            if self.vim_recording_command {
+                                self.abort_vim_command();
+                            }
+                            self.begin_vim_command(event);
+                            if self.vim_pending_op.is_some() {
+                                self.vim_pending_op = None;
+                            }
+                            let count = self.vim_take_count();
+                            let mut start = self.cursor_pos;
+                            for _ in 0..count {
+                                start = self.prev_atomic_boundary(start);
+                                if start == 0 {
+                                    break;
+                                }
+                            }
+                            self.vim_store_range(start, self.cursor_pos);
+                            self.delete_backward(count);
+                            self.finish_vim_command();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('p'),
+                            ..
+                        } => {
+                            if self.vim_recording_command {
+                                self.abort_vim_command();
+                            }
+                            self.begin_vim_command(event);
+                            let count = self.vim_take_count();
+                            self.vim_put_after(count);
+                            self.finish_vim_command();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('P'),
+                            ..
+                        } => {
+                            if self.vim_recording_command {
+                                self.abort_vim_command();
+                            }
+                            self.begin_vim_command(event);
+                            let count = self.vim_take_count();
+                            self.vim_put_before(count);
+                            self.finish_vim_command();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char(_),
+                            ..
+                        } if self.vim_pending_op.is_some() => {
+                            self.mark_unhandled_vim_key(event);
+                            self.abort_vim_command();
+                            self.vim_pending_op = None;
+                            self.vim_pending_textobj = None;
+                            self.vim_clear_count();
+                            return;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('D'),
+                            ..
+                        } => {
+                            if self.vim_recording_command {
+                                self.abort_vim_command();
+                            }
+                            self.begin_vim_command(event);
+                            let count = self.vim_take_count();
+                            for i in 0..count {
+                                self.kill_to_end_of_line();
+                                if i + 1 < count
+                                    && self.cursor_pos < self.text.len()
+                                    && self.text.as_bytes()[self.cursor_pos] == b'\n'
+                                {
+                                    self.delete_forward(1);
+                                }
+                            }
+                            self.finish_vim_command();
+                            return;
+                        }
+                        _ => {
+                            self.vim_clear_count();
+                            // Ignore other keys in Normal mode
+                            self.mark_unhandled_vim_key(event);
+                            return;
+                        }
+                    }
+                }
+                VimState::Insert => {
+                    // fall through to default behavior below
+                }
+            }
+        }
+
+        let recording_insert = self.vim_mode_enabled
+            && matches!(self.vim_state, VimState::Insert)
+            && self.vim_recording_command;
+        if recording_insert {
+            self.push_vim_command_event(event);
+        }
+
         match event {
             // Some terminals (or configurations) send Control key chords as
             // C0 control characters without reporting the CONTROL modifier.
@@ -406,6 +2074,115 @@ impl TextArea {
         }
     }
 
+    /// Enable or disable Vim key bindings. When enabled, the default state is Insert.
+    pub fn set_vim_mode_enabled(&mut self, enabled: bool) {
+        self.vim_mode_enabled = enabled;
+        self.vim_state = VimState::Insert;
+        self.vim_pending_op = None;
+        self.vim_input_count = None;
+        self.vim_last_change = None;
+        self.vim_pending_find = None;
+        self.vim_pending_g = false;
+        self.vim_last_find = None;
+        self.vim_last_unhandled = None;
+    }
+
+    /// Returns true when Vim mode is enabled and the state machine is currently in Normal mode.
+    pub fn vim_is_normal_mode(&self) -> bool {
+        self.vim_mode_enabled && matches!(self.vim_state, VimState::Normal)
+    }
+
+    /// Return a short label for the current Vim mode, if Vim is enabled.
+    /// Used by the footer to display INSERT/NORMAL.
+    pub fn vim_mode_state_label(&self) -> Option<String> {
+        if !self.vim_mode_enabled {
+            return None;
+        }
+        if matches!(self.vim_state, VimState::Insert) {
+            return Some("INSERT".to_string());
+        }
+
+        let mut parts: Vec<String> = vec!["NORMAL".to_string()];
+
+        if let Some(count) = self.vim_input_count {
+            parts.push(format!("count:{count}"));
+        }
+
+        if let Some(op) = self.vim_pending_op {
+            let label = match op {
+                VimPendingOperator::Delete => "d…",
+                VimPendingOperator::Change => "c…",
+                VimPendingOperator::Yank => "y…",
+            };
+            parts.push(label.to_string());
+        }
+
+        if self.vim_pending_g {
+            parts.push("g?".to_string());
+        }
+
+        if let Some(obj) = self.vim_pending_textobj {
+            let label = match obj {
+                VimPendingTextObject::Inner => "iw?",
+                VimPendingTextObject::Around => "aw?",
+            };
+            parts.push(label.to_string());
+        }
+
+        if let Some(find) = self.vim_pending_find {
+            let symbol = match find {
+                VimPendingFind::ForwardInclusive => "f",
+                VimPendingFind::ForwardExclusive => "t",
+            };
+            parts.push(format!("{symbol}?"));
+        }
+
+        if self.vim_pending_replace {
+            parts.push("r?".to_string());
+        }
+
+        if !self.vim_last_command.is_empty() && !self.vim_recording_command {
+            parts.push(".ready".to_string());
+        }
+
+        if parts.len() == 1 {
+            return Some(parts.into_iter().next().unwrap());
+        }
+
+        Some(parts.join(" · "))
+    }
+
+    pub fn vim_mode_enabled(&self) -> bool {
+        self.vim_mode_enabled
+    }
+
+    fn vim_delete_current_line(&mut self) {
+        let bol = self.beginning_of_current_line();
+        let eol = self.end_of_current_line();
+        // Delete newline after line if present to remove the line cleanly.
+        let mut end = eol;
+        if eol < self.text.len() {
+            // There is a newline following this line.
+            end = end.saturating_add(1);
+        }
+        self.vim_store_range(bol, end);
+        self.replace_range(bol..end, "");
+        // Cursor is placed at start of the deleted region by replace_range
+        // which matches expected behavior for dd.
+    }
+
+    fn vim_delete_forward_to(&mut self, mut end: usize) {
+        let start = self.cursor_pos;
+        if end == start {
+            // Ensure we delete at least one atom if possible.
+            end = self.next_atomic_boundary(start);
+        }
+        if end > start {
+            self.vim_store_range(start, end);
+            self.replace_range(start..end, "");
+        }
+    }
+
     // ####### Input Functions #######
     pub fn delete_backward(&mut self, n: usize) {
         if n == 0 || self.cursor_pos == 0 {
@@ -456,9 +2233,11 @@ impl TextArea {
         let eol = self.end_of_current_line();
         if self.cursor_pos == eol {
             if eol < self.text.len() {
+                self.vim_store_range(self.cursor_pos, eol + 1);
                 self.replace_range(self.cursor_pos..eol + 1, "");
             }
         } else {
+            self.vim_store_range(self.cursor_pos, eol);
             self.replace_range(self.cursor_pos..eol, "");
         }
     }
@@ -467,9 +2246,11 @@ impl TextArea {
         let bol = self.beginning_of_current_line();
         if self.cursor_pos == bol {
             if bol > 0 {
+                self.vim_store_range(bol - 1, bol);
                 self.replace_range(bol - 1..bol, "");
             }
         } else {
+            self.vim_store_range(bol, self.cursor_pos);
             self.replace_range(bol..self.cursor_pos, "");
         }
     }
@@ -824,6 +2605,47 @@ impl TextArea {
         self.adjust_pos_out_of_elements(candidate, false)
     }
 
+    /// Start of the next word (Vim 'w'). If currently on a word, moves to the
+    /// start of the following word; if on whitespace, moves to the first
+    /// non-whitespace ahead. Falls back to end-of-text when no next word.
+    pub(crate) fn beginning_of_next_word(&self) -> usize {
+        let text = &self.text[self.cursor_pos..];
+        if text.is_empty() {
+            return self.text.len();
+        }
+        let mut offset = 0usize;
+        let mut chars = text.chars();
+        let first = chars.next().unwrap();
+        if first.is_whitespace() {
+            // Skip whitespace to the start of the next word.
+            offset += 1;
+            for c in chars {
+                if !c.is_whitespace() {
+                    break;
+                }
+                offset += 1;
+            }
+            let pos = (self.cursor_pos + offset).min(self.text.len());
+            self.adjust_pos_out_of_elements(pos, true)
+        } else {
+            // Inside a word: skip to its end, then skip following whitespace to next word start.
+            // Find end of current word
+            let rest = &self.text[self.cursor_pos..];
+            let end_rel = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+            let after_word = self.cursor_pos + end_rel;
+            let after = &self.text[after_word..];
+            if after.is_empty() {
+                return self.text.len();
+            }
+            let ws = after.find(|c: char| !c.is_whitespace());
+            let pos = match ws {
+                Some(non_ws) => after_word + non_ws,
+                None => self.text.len(),
+            };
+            self.adjust_pos_out_of_elements(pos, true)
+        }
+    }
+
     fn adjust_pos_out_of_elements(&self, pos: usize, prefer_start: bool) -> usize {
         if let Some(idx) = self.find_element_containing(pos) {
             let e = &self.elements[idx];
@@ -996,6 +2818,8 @@ mod tests {
     fn ta_with(text: &str) -> TextArea {
         let mut t = TextArea::new();
         t.insert_str(text);
+        t.undo_stack.clear();
+        t.redo_stack.clear();
         t
     }
 
@@ -1243,6 +3067,574 @@ mod tests {
     }
 
     #[test]
+    fn vim_mode_basic_navigation_and_insert() {
+        let mut t = ta_with("hello world\nsecond");
+        // Enable Vim mode (defaults to Insert state)
+        t.set_vim_mode_enabled(true);
+
+        // ESC -> Normal
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        // Place cursor at BOL to ensure 'l' can move right
+        t.set_cursor(0);
+        // 'l' moves right from BOL
+        let c0 = t.cursor();
+        t.input(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(t.cursor() > c0);
+        // '0' -> BOL
+        t.input(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        assert_eq!(t.cursor(), 0);
+        // '$' -> EOL of first line
+        t.input(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE));
+        let eol = "hello world".len();
+        assert_eq!(t.cursor(), eol);
+        // 'k' at first line should stay within bounds (no panic)
+        t.input(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+
+        // 'b' beginning of previous word from end of first line
+        t.input(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(t.cursor() < eol);
+        // 'e' end of next word
+        t.input(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(t.cursor() <= eol);
+
+        // 'i' enter insert mode and insert a char
+        t.input(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        let before = t.text().len();
+        t.input(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE));
+        assert_eq!(t.text().len(), before + 1);
+
+        // ESC normal; 'x' deletes one char
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let before_del = t.text().len();
+        t.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(t.text().len(), before_del.saturating_sub(1));
+    }
+
+    #[test]
+    fn vim_mode_dd_deletes_current_line() {
+        let mut t = ta_with("alpha\nbeta\ngamma");
+        // Position cursor somewhere on the middle line
+        let pos_beta = t.text().find("beta").unwrap() + 2; // inside 'beta'
+        t.set_cursor(pos_beta);
+        t.set_vim_mode_enabled(true);
+        // Enter Normal
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // dd
+        t.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        // Expect 'beta\n' removed; remaining text should be "alpha\ngamma" or "alpha\n\ngamma" depending on trailing newline handling.
+        assert_eq!(t.text(), "alpha\ngamma");
+        // Cursor should be at the position where the deleted line used to start
+        // i.e., at the newline between 'alpha' and 'gamma', or at start of 'gamma'
+        let pos_gamma = t.text().find("gamma").unwrap();
+        assert!(t.cursor() == pos_gamma || t.cursor() == pos_gamma.saturating_sub(1));
+    }
+
+    #[test]
+    fn vim_mode_dw_and_de() {
+        // Case 1: 'dw' from start of word removes word and trailing space
+        let mut t = ta_with("foo bar baz");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        // dw
+        t.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "bar baz");
+        assert_eq!(t.cursor(), 0);
+
+        // Case 2: 'de' from start of word removes word but keeps one space
+        let mut t = ta_with("foo bar");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(t.text(), " bar");
+        assert_eq!(t.cursor(), 0);
+
+        // Case 3: 'dw' on whitespace deletes up to next word start (removes all spaces)
+        let mut t = ta_with("foo   bar");
+        // put cursor on one of the spaces
+        let pos = "foo".len();
+        t.set_cursor(pos);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "foobar");
+        assert_eq!(t.cursor(), pos);
+    }
+
+    #[test]
+    fn vim_mode_counted_motions_and_deletes() {
+        let mut t = ta_with("abcdef");
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        t.set_cursor(0);
+
+        // 3l moves three characters to the right
+        t.input(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(t.cursor(), 3);
+
+        // 2x deletes two characters forward
+        t.input(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "abcf");
+        assert_eq!(t.cursor(), 3);
+    }
+
+    #[test]
+    fn vim_mode_gg_and_g_respect_counts() {
+        let mut t = ta_with("alpha\nbeta\n  gamma");
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Plain G -> last line, first non-blank character
+        t.input(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        assert_eq!(t.text().as_bytes().get(t.cursor()), Some(&b'g'));
+
+        // 2G -> second line start (first non-blank 'b')
+        t.input(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        assert_eq!(t.text().as_bytes().get(t.cursor()), Some(&b'b'));
+
+        // 3gg -> third line first non-blank 'g'
+        t.input(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(t.text().as_bytes().get(t.cursor()), Some(&b'g'));
+
+        // plain gg -> first line first non-blank 'a'
+        t.input(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(t.text().as_bytes().get(t.cursor()), Some(&b'a'));
+    }
+
+    #[test]
+    fn vim_mode_find_and_repeat() {
+        let mut t = ta_with("axbxcdx");
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        t.set_cursor(0);
+
+        // Move to first 'x' to the right
+        t.input(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(t.text().as_bytes().get(t.cursor()), Some(&b'x'));
+
+        // ';' repeat should move to next 'x'
+        t.input(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::NONE));
+        assert_eq!(t.text().as_bytes().get(t.cursor()), Some(&b'x'));
+        // now cursor should be at index 3 (after 'b')
+        assert_eq!(t.cursor(), 3);
+
+        // ',' should move back to previous 'x'
+        t.input(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE));
+        assert_eq!(t.cursor(), 1);
+        assert_eq!(t.text().as_bytes().get(t.cursor()), Some(&b'x'));
+
+        // 't' should land before next 'x'
+        t.input(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        // Should now be on 'b' (the character before the next 'x')
+        assert_eq!(t.text().as_bytes().get(t.cursor()), Some(&b'b'));
+    }
+
+    #[test]
+    fn vim_mode_yy_put_paste_linewise() {
+        let mut t = ta_with("foo\nbar\n");
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        t.set_cursor(0);
+
+        // Yank first line
+        t.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        // Move to line 2 and paste below
+        t.input(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+        assert_eq!(t.text(), "foo\nbar\nfoo\n");
+    }
+
+    #[test]
+    fn vim_mode_yw_and_put() {
+        let mut t = ta_with("hello world");
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        t.set_cursor(0);
+
+        // Yank the first word (including trailing space)
+        t.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+
+        // Move to end and paste after
+        t.input(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+        assert_eq!(t.text(), "hello worldhello ");
+    }
+
+    #[test]
+    fn vim_mode_ciw_deletes_word_and_enters_insert() {
+        let mut t = ta_with("foo bar");
+        let pos = t.text().find("bar").unwrap();
+        t.set_cursor(pos + 1);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+
+        assert_eq!(t.text(), "foo ");
+        assert_eq!(t.vim_mode_state_label().as_deref(), Some("INSERT"));
+        assert_eq!(t.cursor(), 4);
+    }
+
+    #[test]
+    fn vim_mode_diw_removes_word() {
+        let mut t = ta_with("foo bar baz");
+        let pos = t.text().find("bar").unwrap();
+        t.set_cursor(pos + 1);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+
+        assert_eq!(t.text(), "foo  baz");
+        assert_eq!(t.cursor(), pos);
+    }
+
+    #[test]
+    fn vim_mode_yiw_and_put() {
+        let mut t = ta_with("foo bar");
+        let pos = t.text().find("bar").unwrap();
+        t.set_cursor(pos + 1);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+        assert_eq!(t.text(), "foo barbar");
+    }
+
+    #[test]
+    fn vim_mode_caw_includes_trailing_space() {
+        let mut t = ta_with("foo bar   baz");
+        let pos = t.text().find("bar").unwrap();
+        t.set_cursor(pos + 1);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+
+        assert_eq!(t.text(), "foo baz");
+        assert_eq!(t.vim_mode_state_label().as_deref(), Some("INSERT"));
+        assert_eq!(t.cursor(), pos);
+    }
+
+    #[test]
+    fn vim_mode_yaw_captures_space() {
+        let mut t = ta_with("foo bar baz");
+        let pos = t.text().find("bar").unwrap();
+        t.set_cursor(pos + 1);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+
+        // Move to end and paste after
+        t.input(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+        assert_eq!(t.text(), "foo bar bazbar ");
+    }
+
+    #[test]
+    fn vim_status_shows_dynamic_indicators() {
+        let mut t = ta_with("hello world");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // No pending state: should report NORMAL.
+        assert_eq!(t.vim_mode_state_label().as_deref(), Some("NORMAL"));
+
+        // Enter a count.
+        t.input(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        let label = t.vim_mode_state_label().unwrap();
+        assert!(
+            label.contains("count:12"),
+            "expected count label, got {label}"
+        );
+
+        // Await find target.
+        t.input(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        let label = t.vim_mode_state_label().unwrap();
+        assert!(
+            label.contains("f?"),
+            "expected find pending label, got {label}"
+        );
+
+        // Provide the target to move and clear pending find/count.
+        t.input(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+
+        // Perform an edit to record a repeatable command.
+        t.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let label = t.vim_mode_state_label().unwrap();
+        assert!(
+            label.contains(".ready"),
+            "expected dot-ready indicator, got {label}"
+        );
+    }
+
+    #[test]
+    fn vim_mode_phase_b_regressions() {
+        let mut t = ta_with("foo bar baz");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(t.text(), "x bar baz");
+
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "x x baz");
+
+        t.set_text("hello brave world");
+        let pos = "hello ".len() + 2;
+        t.set_cursor(pos);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "hello  world");
+    }
+
+    #[test]
+    fn vim_mode_r_replaces_characters() {
+        let mut t = ta_with("hello");
+        t.set_cursor(1);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // single replacement
+        t.input(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "hAllo");
+        assert_eq!(t.cursor(), 1);
+
+        // count-based replacement
+        t.input(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "hxxlo");
+        assert_eq!(t.cursor(), 2);
+    }
+
+    #[test]
+    fn vim_mode_dot_repeats_dw() {
+        let mut t = ta_with("one two three");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "two three");
+
+        t.input(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "three");
+    }
+
+    #[test]
+    fn vim_mode_dot_repeats_ciw_with_insert() {
+        let mut t = ta_with("foo bar baz");
+        let pos = t.text().find("foo").unwrap();
+        t.set_cursor(pos + 1);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(t.text(), "X bar baz");
+
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "X X baz");
+    }
+
+    #[test]
+    fn vim_mode_dot_repeats_r_command() {
+        let mut t = ta_with("abcd");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "aXcd");
+
+        t.input(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "aXXd");
+    }
+
+    #[test]
+    fn vim_mode_dot_repeats_paste() {
+        let mut t = ta_with("hello world");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "hello worldhello ");
+
+        t.input(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "hello worldhello hello ");
+    }
+
+    #[test]
+    fn vim_mode_dot_repeats_with_count() {
+        let mut t = ta_with("abcdef");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "cdef");
+
+        t.input(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "ef");
+    }
+
+    #[test]
+    fn vim_mode_failed_find_cancels_operator() {
+        let mut t = ta_with("abc");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert_eq!(t.text(), "abc");
+        assert_eq!(t.cursor(), 0);
+        assert_eq!(t.vim_mode_state_label().as_deref(), Some("NORMAL"));
+
+        t.input(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "abc");
+        assert_eq!(t.cursor(), 1);
+        assert_eq!(t.vim_mode_state_label().as_deref(), Some("NORMAL"));
+    }
+    #[test]
+    fn vim_mode_undo_redo_basic() {
+        let mut t = ta_with("hello");
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        t.set_cursor(0);
+
+        // Insert 'X' at start
+        t.input(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(t.text(), "Xhello");
+
+        // Undo should restore original text
+        t.input(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "hello");
+
+        // Redo restores insertion
+        t.input(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(t.text(), "Xhello");
+    }
+
+    #[test]
+    fn vim_inner_word_range_basic() {
+        let mut t = ta_with("foo bar");
+        t.set_cursor(1);
+        let range = t.vim_inner_word_range().unwrap();
+        assert_eq!(range, (0, 3));
+
+        t.set_cursor(4);
+        let range = t.vim_inner_word_range().unwrap();
+        assert_eq!(range, (4, 7));
+    }
+
+    #[test]
+    fn vim_around_word_includes_trailing_space() {
+        let mut t = ta_with("foo bar   baz");
+        t.set_cursor(5); // inside "bar"
+        let range = t.vim_around_word_range().unwrap();
+        assert_eq!(range, (4, 10)); // "bar   "
+    }
+
+    #[test]
+    fn vim_mode_cw_enters_insert() {
+        let mut t = ta_with("hello world");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+
+        assert_eq!(t.text(), "world");
+        assert_eq!(t.vim_mode_state_label().as_deref(), Some("INSERT"));
+    }
+
+    #[test]
+    fn vim_mode_cc_changes_line_and_enters_insert() {
+        let mut t = ta_with("foo\nbar");
+        t.set_cursor(0);
+        t.set_vim_mode_enabled(true);
+        t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        t.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        assert_eq!(
+            t.text(),
+            "
+bar"
+        );
+        assert_eq!(t.cursor(), 0);
+        assert_eq!(t.vim_mode_state_label().as_deref(), Some("INSERT"));
+    }
+
+    #[test]
     fn delete_backward_word_alt_keys() {
         // Test the custom Alt+Ctrl+h binding
         let mut t = ta_with("hello world");
@@ -1332,7 +3724,7 @@ mod tests {
     }
 
     #[test]
-    fn home_end_and_emacs_style_home_end() {
+    fn home_end_and_default_style_home_end() {
         let mut t = ta_with("one\ntwo\nthree");
         // Position at middle of second line
         let second_line_start = t.text().find("two").unwrap();

@@ -247,23 +247,29 @@ mod tests {
             .and_then(|p| p.canonicalize().ok())
             .map(|p| p.to_string_lossy().to_string());
 
-        let tempdir_policy_entry = if tmpdir_env_var.is_some() {
-            r#" (subpath (param "WRITABLE_ROOT_2"))"#
+        let slash_tmp_canon = PathBuf::from("/tmp")
+            .canonicalize()
+            .expect("canonicalize /tmp");
+        let slash_tmp_git = slash_tmp_canon.join(".git");
+        let slash_tmp_policy = if slash_tmp_git.is_dir() {
+            "(require-all (subpath (param \"WRITABLE_ROOT_1\")) (require-not (subpath (param \"WRITABLE_ROOT_1_RO_0\"))) )"
+                .to_string()
         } else {
-            ""
+            "(subpath (param \"WRITABLE_ROOT_1\"))".to_string()
         };
 
+        let tempdir_policy_entry = tmpdir_env_var.as_deref().map_or_else(
+            || "".to_string(),
+            |_| " (subpath (param \"WRITABLE_ROOT_2\"))".to_string(),
+        );
+
         // Build the expected policy text using a raw string for readability.
-        // Note that the policy includes:
-        // - the base policy,
-        // - read-only access to the filesystem,
-        // - write access to WRITABLE_ROOT_0 (but not its .git) and WRITABLE_ROOT_1.
         let expected_policy = format!(
             r#"{MACOS_SEATBELT_BASE_POLICY}
 ; allow read-only file operations
 (allow file-read*)
 (allow file-write*
-(require-all (subpath (param "WRITABLE_ROOT_0")) (require-not (subpath (param "WRITABLE_ROOT_0_RO_0"))) ) (subpath (param "WRITABLE_ROOT_1")){tempdir_policy_entry}
+(require-all (subpath (param "WRITABLE_ROOT_0")) (require-not (subpath (param "WRITABLE_ROOT_0_RO_0"))) ) {slash_tmp_policy}{tempdir_policy_entry}
 )
 "#,
         );
@@ -279,14 +285,15 @@ mod tests {
                 "-DWRITABLE_ROOT_0_RO_0={}",
                 root_with_git_git_canon.to_string_lossy()
             ),
-            format!(
-                "-DWRITABLE_ROOT_1={}",
-                PathBuf::from("/tmp")
-                    .canonicalize()
-                    .expect("canonicalize /tmp")
-                    .to_string_lossy()
-            ),
+            format!("-DWRITABLE_ROOT_1={}", slash_tmp_canon.to_string_lossy()),
         ];
+
+        if slash_tmp_git.is_dir() {
+            expected_args.push(format!(
+                "-DWRITABLE_ROOT_1_RO_0={}",
+                slash_tmp_git.to_string_lossy()
+            ));
+        }
 
         if let Some(p) = tmpdir_env_var {
             expected_args.push(format!("-DWRITABLE_ROOT_2={p}"));
