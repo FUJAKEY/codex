@@ -1256,6 +1256,7 @@ pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::config_types::HistoryPersistence;
+    use crate::config_types::McpServerTransportConfig;
     use crate::config_types::Notifications;
 
     use super::*;
@@ -2230,7 +2231,16 @@ command = "false"
         )?;
 
         // shared should be overridden by project
-        assert_eq!(cfg.mcp_servers.get("shared").unwrap().args, vec!["project"]);
+        let shared_server = cfg
+            .mcp_servers
+            .get("shared")
+            .expect("shared server should exist");
+        match &shared_server.transport {
+            McpServerTransportConfig::Stdio { args, .. } => {
+                assert_eq!(args, &["project".to_string()]);
+            }
+            transport => panic!("expected stdio transport, got {transport:?}"),
+        }
         assert!(cfg.mcp_servers.contains_key("only-project"));
         assert!(cfg.mcp_servers.contains_key("only-global"));
 
