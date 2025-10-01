@@ -1091,7 +1091,7 @@ pub(crate) struct ApplyPatchCommandContext {
 async fn submission_loop(
     sess: Arc<Session>,
     turn_context: TurnContext,
-    config: Arc<Config>,
+    mut config: Arc<Config>,
     rx_sub: Receiver<Submission>,
 ) {
     // Wrap once to avoid cloning TurnContext for each task.
@@ -1110,6 +1110,7 @@ async fn submission_loop(
                 model,
                 effort,
                 summary,
+                auto_compact,
             } => {
                 // Recalculate the persistent turn context with provided overrides.
                 let prev = Arc::clone(&turn_context);
@@ -1132,6 +1133,10 @@ async fn submission_loop(
 
                 // Build updated config for the client
                 let mut updated_config = (*config).clone();
+                if let Some(auto_compact_enabled) = auto_compact {
+                    updated_config.auto_compact_enabled = auto_compact_enabled;
+                    Arc::make_mut(&mut config).auto_compact_enabled = auto_compact_enabled;
+                }
                 updated_config.model = effective_model.clone();
                 updated_config.model_family = effective_family.clone();
                 if let Some(model_info) = get_model_info(&effective_family) {
