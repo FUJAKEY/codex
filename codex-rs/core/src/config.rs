@@ -25,6 +25,7 @@ use crate::protocol::SandboxPolicy;
 use anyhow::Context;
 use codex_app_server_protocol::Tools;
 use codex_app_server_protocol::UserSavedConfig;
+use codex_protocol::config_types::AutoCompactMode;
 use codex_protocol::config_types::ReasoningEffort;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
@@ -73,8 +74,8 @@ pub struct Config {
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,
 
-    /// When `false`, automatic compaction is disabled even if a token limit is set.
-    pub auto_compact_enabled: bool,
+    /// Control for automatic conversation compaction.
+    pub auto_compact_mode: AutoCompactMode,
 
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
@@ -643,8 +644,9 @@ pub struct ConfigToml {
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,
 
-    /// Enable or disable automatic conversation compaction.
-    pub auto_compact: Option<bool>,
+    /// Nested table for auto-compaction controls.
+    #[serde(default)]
+    pub auto_compact: Option<AutoCompactToml>,
 
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
@@ -735,6 +737,13 @@ pub struct ConfigToml {
 
     /// OTEL configuration.
     pub otel: Option<crate::config_types::OtelConfigToml>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct AutoCompactToml {
+    pub mode: Option<AutoCompactMode>,
+    #[serde(rename = "threshold_tokens")]
+    pub threshold_tokens: Option<i64>,
 }
 
 impl From<ConfigToml> for UserSavedConfig {
@@ -875,6 +884,8 @@ pub struct ConfigOverrides {
     pub include_view_image_tool: Option<bool>,
     pub show_raw_agent_reasoning: Option<bool>,
     pub tools_web_search_request: Option<bool>,
+    pub auto_compact_mode: Option<AutoCompactMode>,
+    pub auto_compact_threshold_tokens: Option<i64>,
 }
 
 impl Config {
@@ -903,6 +914,8 @@ impl Config {
             include_view_image_tool,
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
+            auto_compact_mode,
+            auto_compact_threshold_tokens,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -1000,15 +1013,23 @@ impl Config {
                 .as_ref()
                 .map(|info| info.max_output_tokens)
         });
-        let model_auto_compact_token_limit = cfg.model_auto_compact_token_limit.or_else(|| {
-            openai_model_info
+        let auto_compact_cfg = cfg.auto_compact.clone();
+        let auto_compact_profile = config_profile.auto_compact.clone();
+        let auto_compact_mode = auto_compact_mode
+            .or(auto_compact_profile.as_ref().and_then(|ac| ac.mode))
+            .or(auto_compact_cfg.as_ref().and_then(|ac| ac.mode))
+            .unwrap_or_default();
+        let model_auto_compact_token_limit = auto_compact_threshold_tokens
+            .or(auto_compact_profile
                 .as_ref()
-                .and_then(|info| info.auto_compact_token_limit)
-        });
-        let auto_compact_enabled = config_profile
-            .auto_compact
-            .or(cfg.auto_compact)
-            .unwrap_or(true);
+                .and_then(|ac| ac.threshold_tokens))
+            .or(auto_compact_cfg.as_ref().and_then(|ac| ac.threshold_tokens))
+            .or(cfg.model_auto_compact_token_limit)
+            .or_else(|| {
+                openai_model_info
+                    .as_ref()
+                    .and_then(|info| info.auto_compact_token_limit)
+            });
 
         // Load base instructions override from a file if specified. If the
         // path is relative, resolve it against the effective cwd so the
@@ -1033,7 +1054,7 @@ impl Config {
             model_context_window,
             model_max_output_tokens,
             model_auto_compact_token_limit,
-            auto_compact_enabled,
+            auto_compact_mode,
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,
@@ -1811,7 +1832,7 @@ model_verbosity = "high"
                 model_context_window: Some(200_000),
                 model_max_output_tokens: Some(100_000),
                 model_auto_compact_token_limit: None,
-                auto_compact_enabled: true,
+                auto_compact_mode: AutoCompactMode::Auto,
                 model_provider_id: "openai".to_string(),
                 model_provider: fixture.openai_provider.clone(),
                 approval_policy: AskForApproval::Never,
@@ -1872,7 +1893,7 @@ model_verbosity = "high"
             model_context_window: Some(16_385),
             model_max_output_tokens: Some(4_096),
             model_auto_compact_token_limit: None,
-            auto_compact_enabled: true,
+            auto_compact_mode: AutoCompactMode::Auto,
             model_provider_id: "openai-chat-completions".to_string(),
             model_provider: fixture.openai_chat_completions_provider.clone(),
             approval_policy: AskForApproval::UnlessTrusted,
@@ -1948,7 +1969,7 @@ model_verbosity = "high"
             model_context_window: Some(200_000),
             model_max_output_tokens: Some(100_000),
             model_auto_compact_token_limit: None,
-            auto_compact_enabled: true,
+            auto_compact_mode: AutoCompactMode::Auto,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: AskForApproval::OnFailure,
@@ -2010,7 +2031,7 @@ model_verbosity = "high"
             model_context_window: Some(272_000),
             model_max_output_tokens: Some(128_000),
             model_auto_compact_token_limit: None,
-            auto_compact_enabled: true,
+            auto_compact_mode: AutoCompactMode::Auto,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: AskForApproval::OnFailure,
