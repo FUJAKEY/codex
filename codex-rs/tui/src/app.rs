@@ -364,6 +364,15 @@ impl App {
             AppEvent::UpdateSandboxPolicy(policy) => {
                 self.chat_widget.set_sandbox_policy(policy);
             }
+            AppEvent::UpdateAutoCompactMode(mode) => {
+                let changed = self.config.auto_compact_mode != mode;
+                self.chat_widget.set_auto_compact_mode(mode);
+                self.config.auto_compact_mode = mode;
+                if changed {
+                    let message = format!("Auto-compact mode set to {}", mode);
+                    self.chat_widget.add_info_message(message, None);
+                }
+            }
             AppEvent::OpenReviewBranchPicker(cwd) => {
                 self.chat_widget.show_review_branch_picker(&cwd).await;
             }

@@ -43,6 +43,7 @@ use codex_core::protocol::ViewImageToolCallEvent;
 use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
 use codex_protocol::ConversationId;
+use codex_protocol::config_types::AutoCompactMode;
 use codex_protocol::parse_command::ParsedCommand;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -1112,6 +1113,9 @@ impl ChatWidget {
             SlashCommand::Approvals => {
                 self.open_approvals_popup();
             }
+            SlashCommand::AutoCompact => {
+                self.open_auto_compact_popup();
+            }
             SlashCommand::Quit => {
                 self.app_event_tx.send(AppEvent::ExitRequest);
             }
@@ -1602,6 +1606,7 @@ impl ChatWidget {
                     model: Some(model_slug.clone()),
                     effort: Some(effort),
                     summary: None,
+                    auto_compact: None,
                 }));
                 tx.send(AppEvent::UpdateModel(model_slug.clone()));
                 tx.send(AppEvent::UpdateReasoningEffort(effort));
@@ -1663,6 +1668,7 @@ impl ChatWidget {
                     model: None,
                     effort: None,
                     summary: None,
+                    auto_compact: None,
                 }));
                 tx.send(AppEvent::UpdateAskForApprovalPolicy(approval));
                 tx.send(AppEvent::UpdateSandboxPolicy(sandbox.clone()));
@@ -1680,6 +1686,65 @@ impl ChatWidget {
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("Select Approval Mode".to_string()),
             footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_auto_compact_popup(&mut self) {
+        let current_mode = self.config.auto_compact_mode;
+        let mut items: Vec<SelectionItem> = Vec::new();
+        let options: &[(AutoCompactMode, &str, &str)] = &[
+            (
+                AutoCompactMode::Auto,
+                "Automatic",
+                "Summarize automatically when token usage approaches the limit.",
+            ),
+            (
+                AutoCompactMode::Manual,
+                "Manual",
+                "Warn when the limit is reached but wait for you to run /compact.",
+            ),
+            (
+                AutoCompactMode::Off,
+                "Off",
+                "Never summarize automatically; rely on /compact or new sessions.",
+            ),
+            (
+                AutoCompactMode::SmartAuto,
+                "Smart auto",
+                "Reserved for future adaptive compaction behaviour (acts like auto).",
+            ),
+        ];
+
+        for (mode, label, description) in options {
+            let is_current = *mode == current_mode;
+            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                tx.send(AppEvent::CodexOp(Op::OverrideTurnContext {
+                    cwd: None,
+                    approval_policy: None,
+                    sandbox_policy: None,
+                    model: None,
+                    effort: None,
+                    summary: None,
+                    auto_compact: Some(*mode),
+                }));
+                tx.send(AppEvent::UpdateAutoCompactMode(*mode));
+            })];
+            items.push(SelectionItem {
+                name: (*label).to_string(),
+                description: Some((*description).to_string()),
+                is_current,
+                actions,
+                dismiss_on_select: true,
+                search_value: None,
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: "Auto-compact".to_string(),
+            subtitle: Some("Control automatic summarization of the conversation".to_string()),
+            footer_hint: Some(STANDARD_POPUP_HINT_LINE.to_string()),
             items,
             ..Default::default()
         });
@@ -1704,6 +1769,10 @@ impl ChatWidget {
     pub(crate) fn set_model(&mut self, model: &str) {
         self.session_header.set_model(model);
         self.config.model = model.to_string();
+    }
+
+    pub(crate) fn set_auto_compact_mode(&mut self, mode: AutoCompactMode) {
+        self.config.auto_compact_mode = mode;
     }
 
     pub(crate) fn add_info_message(&mut self, message: String, hint: Option<String>) {
