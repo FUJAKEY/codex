@@ -1035,7 +1035,17 @@ impl Session {
     }
 
     pub async fn interrupt_task(self: &Arc<Self>) {
-        info!("interrupt received: abort current task, if any");
+        info!("interrupt received: attempt graceful cancel, else abort");
+        // First try to cooperatively cancel a running exec command so we can
+        // capture and return partial output before aborting the entire turn.
+        if let Ok(mut active) = self.active_turn.try_lock()
+            && let Some(at) = active.as_mut()
+            && let Some(notify) = at.exec_cancel.take()
+        {
+            notify.notify_waiters();
+            return;
+        }
+        // Fallback: no exec is running (or not trackable) — abort all tasks.
         self.abort_all_tasks(TurnAbortReason::Interrupted).await;
     }
 

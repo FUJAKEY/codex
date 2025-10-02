@@ -25,6 +25,7 @@ use crate::protocol::ReviewDecision;
 use crate::protocol::SandboxPolicy;
 use crate::shell;
 use codex_otel::otel_event_manager::ToolDecisionSource;
+use tokio::sync::Notify;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutorConfig {
@@ -120,20 +121,40 @@ impl Executor {
             self.approval_cache.insert(request.approval_command.clone());
         }
 
-        // Step 4: Launch the command within the chosen sandbox.
+        // Step 4: Launch the command within the chosen sandbox with cooperative cancel.
+        let cancel = Arc::new(Notify::new());
+        {
+            let mut guard = session.active_turn.lock().await;
+            if let Some(at) = guard.as_mut() {
+                at.exec_cancel = Some(cancel.clone());
+            }
+        }
         let first_attempt = self
             .spawn(
                 request.params.clone(),
                 sandbox_decision.initial_sandbox,
                 &config,
                 stdout_stream.clone(),
+                Some(cancel.clone()),
             )
             .await;
 
         // Step 5: Handle sandbox outcomes, optionally escalating to an unsandboxed retry.
         match first_attempt {
-            Ok(output) => Ok(output),
+            Ok(output) => {
+                // Clear cancel hook
+                let mut guard = session.active_turn.lock().await;
+                if let Some(at) = guard.as_mut() {
+                    at.exec_cancel = None;
+                }
+                Ok(output)
+            }
             Err(CodexErr::Sandbox(SandboxErr::Timeout { output })) => {
+                // Clear cancel hook
+                let mut guard = session.active_turn.lock().await;
+                if let Some(at) = guard.as_mut() {
+                    at.exec_cancel = None;
+                }
                 Err(CodexErr::Sandbox(SandboxErr::Timeout { output }).into())
             }
             Err(CodexErr::Sandbox(error)) => {
@@ -144,17 +165,30 @@ impl Executor {
                         session,
                         context,
                         stdout_stream,
+                        cancel,
                         error,
                     )
                     .await
                 } else {
+                    // Clear cancel hook
+                    let mut guard = session.active_turn.lock().await;
+                    if let Some(at) = guard.as_mut() {
+                        at.exec_cancel = None;
+                    }
                     Err(ExecError::rejection(format!(
                         "failed in sandbox {:?} with execution error: {error:?}",
                         sandbox_decision.initial_sandbox
                     )))
                 }
             }
-            Err(err) => Err(err.into()),
+            Err(err) => {
+                // Clear cancel hook
+                let mut guard = session.active_turn.lock().await;
+                if let Some(at) = guard.as_mut() {
+                    at.exec_cancel = None;
+                }
+                Err(err.into())
+            }
         }
     }
 
@@ -167,6 +201,7 @@ impl Executor {
         session: &Session,
         context: &ExecCommandContext,
         stdout_stream: Option<StdoutStream>,
+        cancel: Arc<Notify>,
         sandbox_error: SandboxErr,
     ) -> Result<ExecToolCallOutput, ExecError> {
         session
@@ -206,12 +241,22 @@ impl Executor {
                         SandboxType::None,
                         config,
                         stdout_stream,
+                        Some(cancel.clone()),
                     )
                     .await?;
-
+                // Clear cancel hook
+                let mut guard = session.active_turn.lock().await;
+                if let Some(at) = guard.as_mut() {
+                    at.exec_cancel = None;
+                }
                 Ok(retry_output)
             }
             ReviewDecision::Denied | ReviewDecision::Abort => {
+                // Clear cancel hook
+                let mut guard = session.active_turn.lock().await;
+                if let Some(at) = guard.as_mut() {
+                    at.exec_cancel = None;
+                }
                 Err(ExecError::rejection("exec command rejected by user"))
             }
         }
@@ -223,6 +268,7 @@ impl Executor {
         sandbox: SandboxType,
         config: &ExecutorConfig,
         stdout_stream: Option<StdoutStream>,
+        cancel_notifier: Option<Arc<Notify>>,
     ) -> Result<ExecToolCallOutput, CodexErr> {
         process_exec_tool_call(
             params,
@@ -231,6 +277,7 @@ impl Executor {
             &config.sandbox_cwd,
             &config.codex_linux_sandbox_exe,
             stdout_stream,
+            cancel_notifier,
         )
         .await
     }
