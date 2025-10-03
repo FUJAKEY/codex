@@ -31,7 +31,7 @@ env = { "API_KEY" = "value" }
 The Codex CLI can also be run as an MCP _server_ via `codex mcp-server`. For example, you can use `codex mcp-server` to make Codex available as a tool inside of a multi-agent framework like the OpenAI [Agents SDK](https://platform.openai.com/docs/guides/agents). Use `codex mcp` separately to add/list/get/remove MCP server launchers in your configuration.
 
 ### Codex MCP Server Quickstart
-You can launch a Codex MCP server with the [Model Context Protocol Inspector](https://modelcontextprotocol.io/legacy/tools/inspector):
+You can launch a Codex MCP server with the [Model Context Protocol Inspector](https://modelcontextprotocol.io/docs/tools/inspector):
 
 ``` bash
 npx @modelcontextprotocol/inspector codex mcp-server
