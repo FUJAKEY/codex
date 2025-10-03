@@ -2,6 +2,7 @@
 mod apply_patch;
 mod auth_env;
 mod output_schema;
+mod prehook;
 mod resume;
 mod sandbox;
 mod server_error_exit;

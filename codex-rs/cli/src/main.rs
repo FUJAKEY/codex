@@ -316,6 +316,77 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         Some(Subcommand::Completion(completion_cli)) => {
             print_completion(completion_cli);
         }
+        Some(Subcommand::Apply(apply_cli)) => {
+            // Optional prehook gate for apply via env var (MVP). Disabled by default.
+            if let Ok(server) = std::env::var("PREHOOK_APPLY_MCP") {
+                let cfg = codex_prehook::PrehookConfig {
+                    enabled: true,
+                    backend: "mcp".to_string(),
+                    on_error: codex_prehook::OnErrorPolicy::Fail,
+                    mcp: codex_prehook::McpConfig {
+                        server: Some(server),
+                        tool: Some("codex.prehook.review".to_string()),
+                        connect_timeout_ms: 2_000,
+                        call_timeout_ms: 5_000,
+                    },
+                    script: Default::default(),
+                };
+                let ctx = codex_prehook::Context::new(
+                    codex_prehook::CommandKind::ApplyPatch,
+                    std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
+                    vec![apply_cli.task_id.clone()],
+                );
+                let dispatcher = codex_prehook::PreHookDispatcher::new(cfg);
+                let backend_for_log = "mcp".to_string();
+                let tool_for_log = "codex.prehook.review".to_string();
+                let started = std::time::Instant::now();
+                let res = dispatcher.run(&ctx).await;
+                let duration_ms = started.elapsed().as_millis() as u64;
+                match res {
+                    Ok(codex_prehook::Outcome::Allow { .. })
+                    | Ok(codex_prehook::Outcome::Augment { .. }) => {}
+                    Ok(codex_prehook::Outcome::Deny { reason }) => {
+                        tracing::info!(backend=%backend_for_log, decision="deny", duration_ms, correlation_id=%ctx.id, tool=%tool_for_log, "prehook(apply)");
+                        eprintln!("Prehook denied apply: {reason}");
+                        std::process::exit(10);
+                    }
+                    Ok(codex_prehook::Outcome::Ask { message }) => {
+                        tracing::info!(backend=%backend_for_log, decision="ask", duration_ms, correlation_id=%ctx.id, tool=%tool_for_log, "prehook(apply)");
+                        eprintln!("Prehook requires approval (apply): {message}");
+                        std::process::exit(11);
+                    }
+                    Ok(codex_prehook::Outcome::Patch { .. }) => {
+                        tracing::info!(backend=%backend_for_log, decision="patch", duration_ms, correlation_id=%ctx.id, tool=%tool_for_log, "prehook(apply)");
+                        eprintln!(
+                            "Prehook suggested a patch; unsupported in apply gate. Aborting."
+                        );
+                        std::process::exit(12);
+                    }
+                    Ok(codex_prehook::Outcome::Defer { .. }) => {
+                        tracing::info!(backend=%backend_for_log, decision="defer", duration_ms, correlation_id=%ctx.id, tool=%tool_for_log, "prehook(apply)");
+                        eprintln!("Prehook defer for apply; aborting.");
+                        std::process::exit(13);
+                    }
+                    Ok(codex_prehook::Outcome::RateLimit {
+                        retry_after_ms,
+                        message,
+                    }) => {
+                        tracing::info!(backend=%backend_for_log, decision="rate_limit", duration_ms, correlation_id=%ctx.id, tool=%tool_for_log, retry_after_ms, "prehook(apply)");
+                        if let Some(m) = message {
+                            eprintln!("Prehook rate limit: {m}");
+                        }
+                        eprintln!("Retry after: {retry_after_ms} ms");
+                        std::process::exit(14);
+                    }
+                    Err(e) => {
+                        tracing::info!(backend=%backend_for_log, decision="error_fail", duration_ms, correlation_id=%ctx.id, tool=%tool_for_log, error=%format!("{e:#}"), "prehook(apply)");
+                        eprintln!("Prehook error (apply): {e:#}");
+                        std::process::exit(10);
+                    }
+                }
+            }
+            run_apply_command(apply_cli, codex_linux_sandbox_exe).await?;
+        }
         Some(Subcommand::Cloud(mut cloud_cli)) => {
             prepend_config_flags(
                 &mut cloud_cli.config_overrides,
@@ -347,13 +418,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 .await?;
             }
         },
-        Some(Subcommand::Apply(mut apply_cli)) => {
-            prepend_config_flags(
-                &mut apply_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
-            run_apply_command(apply_cli, None).await?;
-        }
+
         Some(Subcommand::ResponsesApiProxy(args)) => {
             tokio::task::spawn_blocking(move || codex_responses_api_proxy::run_main(args))
                 .await??;

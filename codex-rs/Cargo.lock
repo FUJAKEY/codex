@@ -773,6 +773,7 @@ dependencies = [
  "codex-exec",
  "codex-login",
  "codex-mcp-server",
+ "codex-prehook",
  "codex-process-hardening",
  "codex-protocol",
  "codex-protocol-ts",
@@ -786,6 +787,8 @@ dependencies = [
  "supports-color",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -918,6 +921,7 @@ dependencies = [
  "codex-common",
  "codex-core",
  "codex-ollama",
+ "codex-prehook",
  "codex-protocol",
  "core_test_support",
  "libc",
@@ -1105,6 +1109,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-prehook"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "codex-common",
+ "codex-mcp-client",
+ "libc",
+ "mcp-types",
+ "pretty_assertions",
+ "regex-lite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "codex-process-hardening"
 version = "0.0.0"
 dependencies = [
@@ -1231,6 +1256,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.2.1",
  "url",
+ "uuid",
  "vt100",
 ]
 
