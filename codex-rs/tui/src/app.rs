@@ -13,6 +13,7 @@ use crate::resume_picker::ResumeSelection;
 use crate::tui;
 use crate::tui::TuiEvent;
 use codex_ansi_escape::ansi_escape_line;
+use codex_common::approval_presets::ApprovalPreset;
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
 use codex_core::config::Config;
@@ -153,6 +154,8 @@ impl App {
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             backtrack: BacktrackState::default(),
         };
+
+        app.process_pending_admin_controls();
 
         let tui_events = tui.event_stream();
         tokio::pin!(tui_events);
@@ -366,11 +369,14 @@ impl App {
                     }
                 }
             }
-            AppEvent::UpdateAskForApprovalPolicy(policy) => {
-                self.chat_widget.set_approval_policy(policy);
+            AppEvent::ApplyApprovalPreset(preset) => {
+                self.handle_apply_approval_preset(preset)?;
             }
-            AppEvent::UpdateSandboxPolicy(policy) => {
-                self.chat_widget.set_sandbox_policy(policy);
+            AppEvent::DangerJustificationSubmitted { justification } => {
+                self.handle_danger_justification_submission(justification)?;
+            }
+            AppEvent::DangerJustificationCancelled => {
+                self.handle_danger_justification_cancelled()?;
             }
             AppEvent::OpenReviewBranchPicker(cwd) => {
                 self.chat_widget.show_review_branch_picker(&cwd).await;
