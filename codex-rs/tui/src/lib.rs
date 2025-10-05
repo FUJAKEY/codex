@@ -173,6 +173,10 @@ pub async fn run_main(
         }
     };
 
+    if cli.disable_auto_compaction {
+        config.model_auto_compact_token_limit = Some(codex_core::config::AUTO_COMPACT_DISABLED);
+    }
+
     // we load config.toml here to determine project state.
     #[allow(clippy::print_stderr)]
     let config_toml = {
