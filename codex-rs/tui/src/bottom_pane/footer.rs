@@ -63,35 +63,53 @@ pub(crate) fn footer_height(props: FooterProps) -> u16 {
 }
 
 pub(crate) fn render_footer(area: Rect, buf: &mut Buffer, props: FooterProps) {
-    Paragraph::new(prefix_lines(
+    let lines = prefix_lines(
         footer_lines(props),
         " ".repeat(FOOTER_INDENT_COLS).into(),
         " ".repeat(FOOTER_INDENT_COLS).into(),
-    ))
-    .render(area, buf);
+    );
+    Paragraph::new(lines).render(area, buf);
 }
 
 fn footer_lines(props: FooterProps) -> Vec<Line<'static>> {
+    // Show the context indicator on the left, appended after the primary hint
+    // (e.g., "? for shortcuts"). Keep it visible even when typing (i.e., when
+    // the shortcut hint is hidden). Hide it only for the multi-line
+    // ShortcutOverlay.
     match props.mode {
-        FooterMode::CtrlCReminder => vec![ctrl_c_reminder_line(CtrlCReminderState {
-            is_task_running: props.is_task_running,
-        })],
-        FooterMode::ShortcutPrompt => {
-            if props.is_task_running {
-                vec![context_window_line(props.context_window_percent)]
-            } else {
-                vec![Line::from(vec![
-                    key_hint::plain(KeyCode::Char('?')).into(),
-                    " for shortcuts".dim(),
-                ])]
-            }
-        }
         FooterMode::ShortcutOverlay => shortcut_overlay_lines(ShortcutsState {
             use_shift_enter_hint: props.use_shift_enter_hint,
             esc_backtrack_hint: props.esc_backtrack_hint,
         }),
-        FooterMode::EscHint => vec![esc_hint_line(props.esc_backtrack_hint)],
-        FooterMode::Empty => Vec::new(),
+        FooterMode::CtrlCReminder => {
+            let mut line = ctrl_c_reminder_line(CtrlCReminderState {
+                is_task_running: props.is_task_running,
+            });
+            append_context_span(&mut line, props.context_window_percent);
+            vec![line]
+        }
+        FooterMode::EscHint => {
+            let mut line = esc_hint_line(props.esc_backtrack_hint);
+            append_context_span(&mut line, props.context_window_percent);
+            vec![line]
+        }
+        FooterMode::ShortcutPrompt => {
+            if props.is_task_running {
+                // While a task is running, suppress the shortcut hint but still show context.
+                vec![context_window_only_line(props.context_window_percent)]
+            } else {
+                // Context first, then the "? for shortcuts" hint.
+                let mut line = Line::from("");
+                append_context_span(&mut line, props.context_window_percent);
+                line.push_span(" · ".dim());
+                line.extend(vec![
+                    key_hint::plain(KeyCode::Char('?')).into(),
+                    " for shortcuts".dim(),
+                ]);
+                vec![line]
+            }
+        }
+        FooterMode::Empty => vec![context_window_only_line(props.context_window_percent)],
     }
 }
 
@@ -218,19 +236,18 @@ fn build_columns(entries: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn context_window_line(percent: Option<u8>) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    match percent {
-        Some(percent) => {
-            spans.push(format!("{percent}%").dim());
-            spans.push(" context left".dim());
-        }
-        None => {
-            spans.push(key_hint::plain(KeyCode::Char('?')).into());
-            spans.push(" for shortcuts".dim());
-        }
+fn context_window_only_line(percent: Option<u8>) -> Line<'static> {
+    let mut line = Line::from("");
+    append_context_span(&mut line, percent);
+    line
+}
+
+fn append_context_span(line: &mut Line<'static>, percent: Option<u8>) {
+    let percent = percent.unwrap_or(100);
+    if !line.spans.is_empty() {
+        line.push_span(Span::from("   "));
     }
-    Line::from(spans)
+    line.push_span(Span::from(format!("{percent}% context left")).dim());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
