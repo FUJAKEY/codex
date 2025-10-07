@@ -6,6 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
+use ratatui::widgets::Block;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::StatefulWidgetRef;
@@ -170,6 +171,10 @@ impl Renderable for CustomPromptView {
             height: input_height,
         };
         if input_area.width >= 2 {
+            let input_style =
+                crate::style::user_message_style(crate::terminal_palette::default_bg());
+            Block::default().style(input_style).render(input_area, buf);
+
             for row in 0..input_area.height {
                 Paragraph::new(Line::from(vec![gutter()])).render(
                     Rect {
@@ -192,6 +197,7 @@ impl Renderable for CustomPromptView {
                         height: 1,
                     };
                     Clear.render(blank_rect, buf);
+                    buf.set_style(blank_rect, input_style);
                 }
                 let textarea_rect = Rect {
                     x: input_area.x.saturating_add(2),
