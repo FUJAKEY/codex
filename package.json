@@ -2,6 +2,9 @@
   "name": "codex-monorepo",
   "private": true,
   "description": "Tools for repo-wide maintenance.",
+  "bin": {
+    "codex": "bin/codex.mjs"
+  },
   "scripts": {
     "release": "pnpm --filter @openai/codex run release",
     "format": "prettier --check *.json *.md .github/workflows/*.yml",
@@ -14,6 +17,9 @@
     "changelog": "git-cliff --config cliff.toml --output CHANGELOG.ignore.md $LAST_RELEASE_TAG..HEAD",
     "prepare": "node scripts/run-husky.mjs",
     "husky:add": "husky add"
+  },
+  "dependencies": {
+    "@openai/codex": "file:codex-cli"
   },
   "devDependencies": {
     "git-cliff": "^2.8.0",
