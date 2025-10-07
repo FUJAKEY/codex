@@ -1,4 +1,7 @@
-import type { ExecResult } from "./interface.js";
+import type {
+  ExecResult,
+  LandlockSupportResult,
+} from "./interface.js";
 import type { AppConfig } from "../../config.js";
 import type { SpawnOptions } from "child_process";
 
@@ -23,7 +26,7 @@ export async function execWithLandlock(
   config: AppConfig,
   abortSignal?: AbortSignal,
 ): Promise<ExecResult> {
-  const sandboxExecutable = await getSandboxExecutable();
+  const sandboxExecutable = await assertSandboxExecutable();
 
   const extraSandboxPermissions = userProvidedWritableRoots.flatMap(
     (root: string) => ["--sandbox-permission", `disk-write-folder=${root}`],
@@ -53,7 +56,49 @@ export async function execWithLandlock(
  * Lazily initialized promise that resolves to the absolute path of the
  * architecture-specific Landlock helper binary.
  */
-let sandboxExecutablePromise: Promise<string> | null = null;
+let sandboxExecutablePromise: Promise<LandlockSupportResult> | null = null;
+
+function getNormalizedErrorMessage(details: string): string {
+  const trimmedDetails = details.trim();
+  const baseHelp =
+    "To continue in a trusted environment you can set CODEX_UNSAFE_ALLOW_NO_SANDBOX=1 before running Codex, or re-run with --dangerously-auto-approve-everything.";
+
+  if (trimmedDetails.match(/PR_SET_DUMPABLE/i)) {
+    return [
+      "Codex could not enable the Linux sandbox because the kernel rejected prctl(PR_SET_DUMPABLE, 0).",
+      "This commonly happens inside container runtimes or hosts that forbid changing the dumpable flag (for example when Yama ptrace_scope is enforced).",
+      baseHelp,
+      trimmedDetails ? `Details from sandbox helper:\n${trimmedDetails}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  return [
+    ERROR_WHEN_LANDLOCK_NOT_SUPPORTED.trim(),
+    baseHelp,
+    trimmedDetails ? `Details from sandbox helper:\n${trimmedDetails}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function normaliseSandboxFailure(
+  error: NodeJS.ErrnoException,
+  stdout: string,
+  stderr: string,
+): Error {
+  const combined = [stdout, stderr].filter(Boolean).map((text) => text.trim()).filter(Boolean).join("\n");
+
+  const message = getNormalizedErrorMessage([
+    combined,
+    error?.message ?? "",
+  ]
+    .filter(Boolean)
+    .join("\n"));
+
+  return new Error(message, { cause: error });
+}
 
 async function detectSandboxExecutable(): Promise<string> {
   // Find the executable relative to the package.json file.
@@ -139,7 +184,7 @@ function verifySandboxExecutable(sandboxExecutable: string): Promise<void> {
         );
         log(`stdout: ${stdout}`);
         log(`stderr: ${stderr}`);
-        reject(new Error(ERROR_WHEN_LANDLOCK_NOT_SUPPORTED));
+        reject(normaliseSandboxFailure(error, stdout, stderr));
       } else {
         resolve();
       }
@@ -151,12 +196,31 @@ function verifySandboxExecutable(sandboxExecutable: string): Promise<void> {
  * Returns the absolute path to the architecture-specific Landlock helper
  * binary. (Could be a rejected promise if not found.)
  */
-function getSandboxExecutable(): Promise<string> {
+async function resolveSandboxExecutable(): Promise<LandlockSupportResult> {
   if (!sandboxExecutablePromise) {
-    sandboxExecutablePromise = detectSandboxExecutable();
+    sandboxExecutablePromise = (async () => {
+      try {
+        const executable = await detectSandboxExecutable();
+        return { ok: true as const, executable } satisfies LandlockSupportResult;
+      } catch (error) {
+        return {
+          ok: false as const,
+          error: error instanceof Error ? error : new Error(String(error)),
+        } satisfies LandlockSupportResult;
+      }
+    })();
   }
 
   return sandboxExecutablePromise;
+}
+
+function assertSandboxExecutable(): Promise<string> {
+  return resolveSandboxExecutable().then((result) => {
+    if (result.ok) {
+      return result.executable;
+    }
+    throw result.error;
+  });
 }
 
 /** @return name of the native executable to use for Linux sandboxing. */
@@ -172,4 +236,8 @@ function getLinuxSandboxExecutableForCurrentArchitecture(): string {
     default:
       return "codex-linux-sandbox-x64";
   }
+}
+
+export function checkLandlockSupport(): Promise<LandlockSupportResult> {
+  return resolveSandboxExecutable();
 }

@@ -46,6 +46,7 @@ import { initLogger } from "./utils/logger/log";
 import { isModelSupportedForResponses } from "./utils/model-utils.js";
 import { parseToolCall } from "./utils/parsers";
 import { onExit, setInkRenderer } from "./utils/terminal";
+import { runCodexWeb } from "./web/server.js";
 import chalk from "chalk";
 import { spawnSync } from "child_process";
 import fs from "fs";
@@ -69,6 +70,7 @@ const cli = meow(
   Usage
     $ codex [options] <prompt>
     $ codex completion <bash|zsh|fish>
+    $ codex web [options]
 
   Options
     --version                       Print version and exit
@@ -101,6 +103,10 @@ const cli = meow(
                               with models o3 and o4-mini)
 
     --reasoning <effort>      Set the reasoning effort level (low, medium, high) (default: high)
+
+  Web options
+    --port <port>             Port for the local Codex web UI (default: 3210)
+    --no-open-browser         Do not automatically launch the browser when starting 'codex web'
 
   Dangerous options
     --dangerously-auto-approve-everything
@@ -135,6 +141,12 @@ const cli = meow(
         type: "boolean",
         aliases: ["q"],
         description: "Non-interactive quiet mode",
+      },
+      port: { type: "number" },
+      openBrowser: {
+        type: "boolean",
+        default: true,
+        description: "Automatically open the browser when running 'codex web'",
       },
       config: {
         type: "boolean",
@@ -217,6 +229,8 @@ const cli = meow(
   },
 );
 
+const isWebMode = cli.input[0] === "web";
+
 // ---------------------------------------------------------------------------
 // Global flag handling
 // ---------------------------------------------------------------------------
@@ -289,6 +303,9 @@ let config = loadConfig(undefined, undefined, {
 // via the `--history` flag. Therefore it must be declared with `let` rather
 // than `const`.
 let prompt = cli.input[0];
+if (isWebMode) {
+  prompt = cli.input[1];
+}
 const model = cli.flags.model ?? config.model;
 const imagePaths = cli.flags.image;
 const provider = cli.flags.provider ?? config.provider ?? "openai";
@@ -415,6 +432,31 @@ try {
   await checkForUpdates();
 } catch {
   // ignore
+}
+
+if (isWebMode) {
+  if (fullContextMode) {
+    // eslint-disable-next-line no-console
+    console.error("The --full-context flag is not supported in web mode.");
+    process.exit(1);
+  }
+
+  const portFlag = cli.flags.port;
+  const port =
+    typeof portFlag === "number" && Number.isFinite(portFlag) && portFlag > 0
+      ? portFlag
+      : undefined;
+  const openBrowser =
+    cli.flags.openBrowser !== undefined ? Boolean(cli.flags.openBrowser) : true;
+  const additionalWritableRoots: ReadonlyArray<string> = (cli.flags.writableRoot ?? [])
+    .map((p) => path.resolve(p));
+
+  await runCodexWeb({
+    config,
+    port: port ?? 3210,
+    additionalWritableRoots,
+    openBrowser,
+  });
 }
 
 // For --flex-mode, validate and exit if incorrect.
