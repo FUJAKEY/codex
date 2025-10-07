@@ -85,6 +85,29 @@ if (wantsNative) {
 
 // Resolve the path to the compiled CLI bundle
 const cliPath = path.resolve(__dirname, "../dist/cli.js");
+
+if (!fs.existsSync(cliPath)) {
+  const buildScript = path.resolve(__dirname, "../build.mjs");
+  const result = spawnSync(process.execPath, [buildScript], {
+    stdio: "inherit",
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  const buildExitCode =
+    typeof result.status === "number" ? result.status : result.signal ? 1 : 0;
+  if (buildExitCode !== 0) {
+    process.exit(buildExitCode);
+  }
+
+  if (!fs.existsSync(cliPath)) {
+    throw new Error(
+      `Codex CLI build output не найден по пути ${cliPath}. Попробуйте переустановить пакет или собрать CLI вручную.`,
+    );
+  }
+}
 const cliUrl = pathToFileURL(cliPath).href;
 
 // Load and execute the CLI
