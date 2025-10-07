@@ -1,4 +1,5 @@
 import { ReviewDecision } from "../../utils/agent/review";
+import { sessionScopedApprovalLabel } from "../../utils/string-utils";
 // TODO: figure out why `cli-spinners` fails on Node v20.9.0
 // which is why we have to do this in the first place
 //
@@ -6,12 +7,22 @@ import { ReviewDecision } from "../../utils/agent/review";
 import { Select } from "../vendor/ink-select/select";
 import TextInput from "../vendor/ink-text-input";
 import { Box, Text, useInput } from "ink";
-import { sessionScopedApprovalLabel } from "../../utils/string-utils";
 import React from "react";
 
 // default deny‑reason:
 const DEFAULT_DENY_MESSAGE =
   "Don't do that, but keep trying to fix the problem";
+
+function extractCommandForDisplay(
+  node: React.ReactNode,
+): string | undefined {
+  if (!React.isValidElement(node)) {
+    return undefined;
+  }
+
+  const value = (node.props as { commandForDisplay?: unknown })?.commandForDisplay;
+  return typeof value === "string" ? value : undefined;
+}
 
 export function TerminalChatCommandReview({
   confirmationPrompt,
@@ -53,21 +64,12 @@ export function TerminalChatCommandReview({
   // -------------------------------------------------------------------------
 
   const showAlwaysApprove = React.useMemo(() => {
-    if (
-      React.isValidElement(confirmationPrompt) &&
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      typeof (confirmationPrompt as any).props?.commandForDisplay === "string"
-    ) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const command: string = (confirmationPrompt as any).props
-        .commandForDisplay;
-      // Grab the first token of the first line – that corresponds to the base
-      // command even when the string contains embedded newlines (e.g. diffs).
+    const command = extractCommandForDisplay(confirmationPrompt);
+    if (typeof command === "string") {
       const baseCmd = command.split("\n")[0]?.trim().split(/\s+/)[0] ?? "";
       return baseCmd !== "apply_patch";
     }
-    // Default to showing the option when we cannot reliably detect the base
-    // command.
+    // Default to showing the option when we cannot reliably detect the base command.
     return true;
   }, [confirmationPrompt]);
 
@@ -88,12 +90,9 @@ export function TerminalChatCommandReview({
 
     if (showAlwaysApprove) {
       let label: string;
-      if (
-        React.isValidElement(confirmationPrompt) &&
-        typeof (confirmationPrompt as any).props?.commandForDisplay === "string"
-      ) {
-        const cmd: string = (confirmationPrompt as any).props.commandForDisplay;
-        label = sessionScopedApprovalLabel(cmd, 30);
+      const command = extractCommandForDisplay(confirmationPrompt);
+      if (typeof command === "string") {
+        label = sessionScopedApprovalLabel(command, 30);
       } else {
         label = "Always allow this command for the remainder of the session (a)";
       }

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use codex_core::error::CodexErr;
 use codex_core::error::Result;
 use codex_core::error::SandboxErr;
 use codex_core::protocol::SandboxPolicy;
@@ -15,6 +15,7 @@ use landlock::Compatible;
 use landlock::Ruleset;
 use landlock::RulesetAttr;
 use landlock::RulesetCreatedAttr;
+use landlock::RulesetStatus;
 use seccompiler::BpfProgram;
 use seccompiler::SeccompAction;
 use seccompiler::SeccompCmpArgLen;
@@ -24,6 +25,13 @@ use seccompiler::SeccompFilter;
 use seccompiler::SeccompRule;
 use seccompiler::TargetArch;
 use seccompiler::apply_filter;
+
+fn warn_landlock_once(message: &str) {
+    static LANDLOCK_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+    if !LANDLOCK_WARNING_EMITTED.swap(true, Ordering::SeqCst) {
+        eprintln!("[codex-linux-sandbox] {message}");
+    }
+}
 
 /// Apply sandbox policies inside this thread so only the child inherits
 /// them, not the entire CLI process.
@@ -69,10 +77,27 @@ fn install_filesystem_landlock_rules_on_current_thread(writable_roots: Vec<PathB
         ruleset = ruleset.add_rules(landlock::path_beneath_rules(&writable_roots, access_rw))?;
     }
 
-    let status = ruleset.restrict_self()?;
+    let status = match ruleset.restrict_self() {
+        Ok(status) => status,
+        Err(err) => {
+            warn_landlock_once(&format!(
+                "Landlock sandbox could not be enforced ({err}); continuing without filesystem write restrictions.",
+            ));
+            return Ok(());
+        }
+    };
 
-    if status.ruleset == landlock::RulesetStatus::NotEnforced {
-        return Err(CodexErr::Sandbox(SandboxErr::LandlockRestrict));
+    if status.ruleset == RulesetStatus::NotEnforced {
+        warn_landlock_once(
+            "Landlock sandbox is not enforced by the current kernel; continuing without filesystem write restrictions.",
+        );
+        return Ok(());
+    }
+
+    if status.ruleset == RulesetStatus::PartiallyEnforced {
+        warn_landlock_once(
+            "Landlock sandbox is only partially enforced; some write paths may remain writable.",
+        );
     }
 
     Ok(())

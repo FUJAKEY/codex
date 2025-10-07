@@ -33,10 +33,10 @@ import { ReviewDecision } from "./utils/agent/review";
 import { AutoApprovalMode } from "./utils/auto-approval-mode";
 import { checkForUpdates } from "./utils/check-updates";
 import {
-  loadConfig,
-  PRETTY_PRINT,
   INSTRUCTIONS_FILEPATH,
+  loadConfig,
 } from "./utils/config";
+import { formatResponseItemForDisplay } from "./utils/format-response.js";
 import {
   getApiKey as fetchApiKey,
   maybeRedeemCredits,
@@ -44,8 +44,8 @@ import {
 import { createInputItem } from "./utils/input-utils";
 import { initLogger } from "./utils/logger/log";
 import { isModelSupportedForResponses } from "./utils/model-utils.js";
-import { parseToolCall } from "./utils/parsers";
 import { onExit, setInkRenderer } from "./utils/terminal";
+import { runWebServer } from "./web/server.js";
 import chalk from "chalk";
 import { spawnSync } from "child_process";
 import fs from "fs";
@@ -69,6 +69,7 @@ const cli = meow(
   Usage
     $ codex [options] <prompt>
     $ codex completion <bash|zsh|fish>
+    $ codex web [options]
 
   Options
     --version                       Print version and exit
@@ -93,6 +94,9 @@ const cli = meow(
     --project-doc <file>       Include an additional markdown file at <file> as context
     --full-stdout              Do not truncate stdout/stderr from command outputs
     --notify                   Enable desktop notifications for responses
+    --port <number>            Port for the web interface (default: 4873)
+    --host <host>              Hostname for the web interface (default: localhost)
+    --[no-]open                Automatically open the browser in web mode (default: true)
 
     --disable-response-storage Disable server‑side response storage (sends the
                                full conversation context with every request)
@@ -187,6 +191,19 @@ const cli = meow(
           "Disable truncation of command stdout/stderr messages (show everything)",
         aliases: ["no-truncate"],
       },
+      port: {
+        type: "number",
+        description: "Port to use for the web interface",
+      },
+      host: {
+        type: "string",
+        description: "Hostname to bind the web interface to",
+      },
+      open: {
+        type: "boolean",
+        default: true,
+        description: "Automatically open the browser when starting in web mode",
+      },
       reasoning: {
         type: "string",
         description: "Set the reasoning effort level (low, medium, high)",
@@ -256,6 +273,11 @@ complete -c codex -a '(__fish_complete_path)' -d 'file path'`,
 // For --help, show help and exit.
 if (cli.flags.help) {
   cli.showHelp();
+}
+
+if (cli.input[0] === "web") {
+  await runWebMode();
+  process.exit(0);
 }
 
 // For --config, open custom instructions file in editor and exit.
@@ -588,55 +610,6 @@ const instance = render(
 );
 setInkRenderer(instance);
 
-function formatResponseItemForQuietMode(item: ResponseItem): string {
-  if (!PRETTY_PRINT) {
-    return JSON.stringify(item);
-  }
-  switch (item.type) {
-    case "message": {
-      const role = item.role === "assistant" ? "assistant" : item.role;
-      const txt = item.content
-        .map((c) => {
-          if (c.type === "output_text" || c.type === "input_text") {
-            return c.text;
-          }
-          if (c.type === "input_image") {
-            return "<Image>";
-          }
-          if (c.type === "input_file") {
-            return c.filename;
-          }
-          if (c.type === "refusal") {
-            return c.refusal;
-          }
-          return "?";
-        })
-        .join(" ");
-      return `${role}: ${txt}`;
-    }
-    case "function_call": {
-      const details = parseToolCall(item);
-      return `$ ${details?.cmdReadableText ?? item.name}`;
-    }
-    case "function_call_output": {
-      // @ts-expect-error metadata unknown on ResponseFunctionToolCallOutputItem
-      const meta = item.metadata as ExecOutputMetadata;
-      const parts: Array<string> = [];
-      if (typeof meta?.exit_code === "number") {
-        parts.push(`code: ${meta.exit_code}`);
-      }
-      if (typeof meta?.duration_seconds === "number") {
-        parts.push(`duration: ${meta.duration_seconds}s`);
-      }
-      const header = parts.length > 0 ? ` (${parts.join(", ")})` : "";
-      return `command.stdout${header}\n${item.output}`;
-    }
-    default: {
-      return JSON.stringify(item);
-    }
-  }
-}
-
 async function runQuietMode({
   prompt,
   imagePaths,
@@ -660,7 +633,7 @@ async function runQuietMode({
     disableResponseStorage: config.disableResponseStorage,
     onItem: (item: ResponseItem) => {
       // eslint-disable-next-line no-console
-      console.log(formatResponseItemForQuietMode(item));
+      console.log(formatResponseItemForDisplay(item));
     },
     onLoading: () => {
       /* intentionally ignored in quiet mode */
@@ -682,6 +655,57 @@ async function runQuietMode({
 
   const inputItem = await createInputItem(prompt, imagePaths);
   await agent.run([inputItem]);
+}
+
+async function runWebMode(): Promise<void> {
+  const fullContextMode = Boolean(cli.flags.fullContext);
+  const config = loadConfig(undefined, undefined, {
+    cwd: process.cwd(),
+    disableProjectDoc: Boolean(cli.flags.noProjectDoc),
+    projectDocPath: cli.flags.projectDoc,
+    isFullContext: fullContextMode,
+  });
+
+  const model = cli.flags.model ?? config.model;
+  const provider = cli.flags.provider ?? config.provider ?? "openai";
+  const additionalWritableRoots: ReadonlyArray<string> = (
+    Array.isArray(cli.flags.writableRoot)
+      ? cli.flags.writableRoot
+      : cli.flags.writableRoot
+        ? [cli.flags.writableRoot]
+        : []
+  ).map((p) => path.resolve(p));
+  const port =
+    typeof cli.flags.port === "number" && Number.isFinite(cli.flags.port)
+      ? cli.flags.port
+      : 4873;
+  const host = cli.flags.host ?? "127.0.0.1";
+  const autoOpen = cli.flags.open !== false;
+
+  if (!process.env["OPENAI_API_KEY"] && config.apiKey) {
+    process.env["OPENAI_API_KEY"] = config.apiKey;
+  }
+
+  const mergedConfig: AppConfig = {
+    ...config,
+    model,
+    provider,
+  };
+
+  if (cli.flags.disableResponseStorage) {
+    mergedConfig.disableResponseStorage = true;
+  }
+
+  await runWebServer({
+    config: mergedConfig,
+    model,
+    provider,
+    approvalPolicy: AutoApprovalMode.FULL_AUTO,
+    additionalWritableRoots,
+    port,
+    host,
+    autoOpen,
+  });
 }
 
 const exit = () => {
