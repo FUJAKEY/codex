@@ -28,3 +28,7 @@ export type ExecOutputMetadata = {
   exit_code: number;
   duration_seconds: number;
 };
+
+export type LandlockSupportResult =
+  | { ok: true; executable: string }
+  | { ok: false; error: Error };

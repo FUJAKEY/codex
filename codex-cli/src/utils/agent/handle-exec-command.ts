@@ -1,6 +1,5 @@
 import type { CommandConfirmation } from "./agent-loop.js";
 import type { ApplyPatchCommand, ApprovalPolicy } from "../../approvals.js";
-import type { ExecInput } from "./sandbox/interface.js";
 import type { ResponseInputItem } from "openai/resources/responses/responses.mjs";
 
 import { canAutoApprove } from "../../approvals.js";
@@ -10,7 +9,13 @@ import { CODEX_UNSAFE_ALLOW_NO_SANDBOX, type AppConfig } from "../config.js";
 import { exec, execApplyPatch } from "./exec.js";
 import { ReviewDecision } from "./review.js";
 import { isLoggingEnabled, log } from "../logger/log.js";
-import { SandboxType } from "./sandbox/interface.js";
+import {
+  SandboxType,
+  type ExecInput,
+  type ExecResult,
+  type LandlockSupportResult,
+} from "./sandbox/interface.js";
+import { checkLandlockSupport } from "./sandbox/landlock.js";
 import { PATH_TO_SEATBELT_EXECUTABLE } from "./sandbox/macos-seatbelt.js";
 import fs from "fs/promises";
 
@@ -24,6 +29,9 @@ import fs from "fs/promises";
 // subsequent, equivalent invocations during the same CLI session.
 // ---------------------------------------------------------------------------
 const alwaysApprovedCommands = new Set<string>();
+
+let landlockSupportPromise: Promise<LandlockSupportResult> | null = null;
+let landlockWarningDisplayed = false;
 
 // ---------------------------------------------------------------------------
 // Helper: Given the argv-style representation of a command, return a stable
@@ -63,6 +71,14 @@ function deriveCommandKey(cmd: Array<string>): string {
   }
 
   return JSON.stringify(cmd);
+}
+
+async function getLandlockSupport(): Promise<LandlockSupportResult> {
+  if (!landlockSupportPromise) {
+    landlockSupportPromise = checkLandlockSupport();
+  }
+
+  return landlockSupportPromise;
 }
 
 type HandleExecCommandResult = {
@@ -250,15 +266,34 @@ async function execCommand(
   // throw. Any internal errors should be mapped to a non-zero value for the
   // exitCode field.
   const start = Date.now();
-  const execResult =
-    applyPatchCommand != null
-      ? execApplyPatch(applyPatchCommand.patch, workdir)
-      : await exec(
-          { ...execInput, additionalWritableRoots },
-          await getSandbox(runInSandbox),
-          config,
-          abortSignal,
-        );
+  let execResult: ExecResult;
+  if (applyPatchCommand != null) {
+    execResult = execApplyPatch(applyPatchCommand.patch, workdir);
+  } else {
+    let sandbox: SandboxType;
+    try {
+      sandbox = await getSandbox(runInSandbox);
+    } catch (error) {
+      const stderr = formatSandboxError(error);
+      if (isLoggingEnabled()) {
+        log(`EXEC sandbox unavailable: ${stderr}`);
+      }
+      const duration = Date.now() - start;
+      return {
+        stdout: "",
+        stderr,
+        exitCode: 1,
+        durationMs: duration,
+      };
+    }
+
+    execResult = await exec(
+      { ...execInput, additionalWritableRoots },
+      sandbox,
+      config,
+      abortSignal,
+    );
+  }
   const duration = Date.now() - start;
   const { stdout, stderr, exitCode } = execResult;
 
@@ -274,6 +309,14 @@ async function execCommand(
     exitCode,
     durationMs: duration,
   };
+}
+
+function formatSandboxError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message || error.toString();
+  }
+
+  return String(error);
 }
 
 /** Return `true` if the `/usr/bin/sandbox-exec` is present and executable. */
@@ -309,10 +352,24 @@ async function getSandbox(runInSandbox: boolean): Promise<SandboxType> {
         );
       }
     } else if (process.platform === "linux") {
-      // TODO: Need to verify that the Landlock sandbox is working. For example,
-      // using Landlock in a Linux Docker container from a macOS host may not
-      // work.
-      return SandboxType.LINUX_LANDLOCK;
+      const support = await getLandlockSupport();
+      if (support.ok) {
+        return SandboxType.LINUX_LANDLOCK;
+      }
+
+      if (CODEX_UNSAFE_ALLOW_NO_SANDBOX) {
+        if (!landlockWarningDisplayed) {
+          landlockWarningDisplayed = true;
+          // eslint-disable-next-line no-console
+          console.warn(
+            "⚠️  Codex is continuing without the Linux sandbox because it is unavailable:\n" +
+              support.error.message,
+          );
+        }
+        return SandboxType.NONE;
+      }
+
+      throw support.error;
     } else if (CODEX_UNSAFE_ALLOW_NO_SANDBOX) {
       // Allow running without a sandbox if the user has explicitly marked the
       // environment as already being sufficiently locked-down.

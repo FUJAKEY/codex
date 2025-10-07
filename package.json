@@ -12,7 +12,7 @@
     "lint:fix": "pnpm --filter @openai/codex run lint:fix",
     "typecheck": "pnpm --filter @openai/codex run typecheck",
     "changelog": "git-cliff --config cliff.toml --output CHANGELOG.ignore.md $LAST_RELEASE_TAG..HEAD",
-    "prepare": "husky",
+    "prepare": "node scripts/run-husky.mjs",
     "husky:add": "husky add"
   },
   "devDependencies": {

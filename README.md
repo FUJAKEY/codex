@@ -143,6 +143,17 @@ That's it - Codex will scaffold a file, run it inside a sandbox, install any
 missing dependencies, and show you the live result. Approve the changes and
 they'll be committed to your working directory.
 
+Prefer a graphical workspace? Launch the experimental web experience:
+
+```shell
+codex web
+```
+
+This starts a local server (default `http://localhost:3210`) with a browser UI that
+streams responses, command output, and summaries. Commands still execute through
+Codex's sandbox where supported; if sandboxing isn't available the UI will flag it
+so you can make an informed decision before continuing.
+
 ---
 
 ## Why Codex?
